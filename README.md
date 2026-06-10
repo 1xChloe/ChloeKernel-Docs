@@ -1,6 +1,6 @@
 # ChloeKernel
 
-> Documentation for [1xChloe/ChloeKernel](https://github.com/1xChloe/ChloeKernel) — the framework source, changelog, and releases live there. This repo carries the docs only.
+> Documentation for [1xChloe/ChloeKernel](https://github.com/1xChloe/ChloeKernel) — the framework source, changelog, and releases live there. This repo carries the docs only; framework access is private, granted individually by Chloe.
 
 Roblox game framework with an OS-style architecture: a genre-agnostic kernel (scheduler, processes, services, IPC, hooks) plus server-side drivers for networking, persistence, replication, anti-exploit, and commerce. Game code registers as services and communicates through kernel primitives; the kernel contains no game rules.
 
@@ -8,7 +8,7 @@ Roblox game framework with an OS-style architecture: a genre-agnostic kernel (sc
 - Server-authoritative: clients send intents, never state; validation chains are fail-closed; per-channel rate limits; lag-compensated hit validation; movement monitoring.
 - **284 specs** run on every Studio play-test boot. Verification status is documented per feature.
 
-Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/selene) and the Argon or Rojo Studio plugin. License: see [LICENSE.md](https://github.com/1xChloe/ChloeKernel/blob/main/LICENSE.md) — use in games is free with attribution; redistribution as a framework is not permitted.
+Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/selene) and the Argon or Rojo Studio plugin. License: see [LICENSE.md](https://github.com/1xChloe/ChloeKernel/blob/main/LICENSE.md) — access is **private**, granted individually by Chloe; use in games requires attribution; sharing or redistribution is not permitted.
 
 ---
 
@@ -1508,11 +1508,12 @@ The full intent security pipeline (rate limit + session check + 3 validators) co
 
 ## License & contributions
 
-ChloeKernel is **source-available** under its own license ([LICENSE.md](https://github.com/1xChloe/ChloeKernel/blob/main/LICENSE.md)). The short version:
+ChloeKernel is **private-access** under its own license ([LICENSE.md](https://github.com/1xChloe/ChloeKernel/blob/main/LICENSE.md)) — access is granted individually by Chloe (CryptedChloes on Roblox, 1xChloe on GitHub) and is revocable. The short version, for those granted access:
 
 - **Allowed:** use it in your Roblox games, commercial or not; modify it freely inside your own game's codebase
 - **Allowed:** contribute improvements via pull requests to this repository
 - **Required:** credit `CryptedChloes` in your game's description — for any game using ChloeKernel
+- **Not allowed:** sharing the source with anyone or granting access on Chloe's behalf — only Chloe grants access
 - **Not allowed:** redistributing it as your own framework — no forks published as separate projects, free or paid
 
 The wire transport (`ChloeKernel/Net/Packet`) is a kernel-maintained port of Packet v1.7 by Suphi Kaner (5uphi); the original work remains credited to its author (see its `CREDITS.md` for attribution and the marked local fixes). Kernel code style is enforced by StyLua + Selene in CI — run `aftman install` to match locally.
