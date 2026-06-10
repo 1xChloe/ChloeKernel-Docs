@@ -904,6 +904,8 @@ task.delay(2, function() Casings:release(Casing) end)
 
 ### Watch everything live with the debug panel
 
+> **Try it live:** [ChloKernel Test](https://www.roblox.com/games/81098553592999/ChloKernel-Test) is the framework's public test place with the debug panel enabled for every joiner — press **F8** in-game to open the CLIENT / SERVER / NET windows on a real server.
+
 An immediate-mode (ImGui-style) debug overlay, split into **three windows — CLIENT, SERVER, and NET** — so each machine's stats read separately and the wire has its own view. Client: FPS, ping, network kbps, physics rate, memory breakdown, scheduler health with hot-task profiling, kernel internals, live log tail. Server (mirrored via diagnostics attributes): sessions, services, scheduler health, hot tasks, net counters. NET: live kernel channel traffic from both machines. All windows drag independently and tooltip to their own right side. **Studio-only by design** — it auto-attaches in Studio and refuses to exist in production unless ReplicatedStorage has the `ChloeKernelDebug` attribute explicitly set to `true`. On a live server, also set `ChloeKernelDebugUserIds` (comma-separated UserIds) to restrict the whole surface to those users: the panel only attaches for them, the NET/log mirrors fire per-recipient (never broadcast — they carry every player's decoded traffic and the full server log), and the simulation controls reject everyone else. **F8** toggles everything (F9 is Roblox's own dev console); title bars drag (dragging never collapses — only a clean click does).
 
 **Reading the panel:**
