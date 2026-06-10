@@ -991,8 +991,11 @@ Kernel:registerService(WeaponKit.service({
 | **SpellKit** | `SK_Cast(spellId)` | mana + regen, cooldowns, channelled casts as killable Processes, damage interrupts | `Spell.Cast/Interrupted` |
 | **CheckpointKit** | server-side `Touched` | stage sequencing, minimum-time validation, profile persistence | `Obby.Checkpoint` |
 | **RoundKit** | — (replica out) | phase cycle, duration timers, MinPlayers gates, countdown replication | `Round.PhaseChanged` |
+| **ProceduralKit** | — (wire yours through `service:validate`) | runtime ProceduralModel spawning, fail-closed parameter validation (type/Min/Max/OneOf), per-model regeneration rate limiting with batched flushes, session-bound lifecycle | `Procedural.Spawned/Updated/Rejected/Removed` |
 
 All kit validation lives in the same fail-closed hook chains (`Intent.WK_Fire`, `Intent.SK_Cast`, `Intent.Checkpoint`) — prepend your own rules at lower priority numbers without forking the kit.
+
+> **ProceduralKit** rides Roblox's ProceduralModels (Studio beta; works in live games when the beta ships): parameter-driven Models whose server-side Generator ModuleScript rebuilds their geometry when Size or an attribute changes. The peer that changes a parameter generates — server writes generate server-side and replicate the results, so generators stay in ServerScriptService where exploiters can't decompile them. The kit validates and clamps every parameter (unknown names and wrong types reject outright), buffers writes behind a per-model cooldown so a spammed customization intent costs one rebuild per window instead of one per message, and ships an ExampleGenerator demonstrating the two generator survival habits: `params:Pause()` in loops (the engine kills generators that work too long without yielding) and deriving ALL randomness from a Seed attribute (every rebuild reruns the generator — unseeded randomness reshuffles the model on every parameter change).
 
 > **Status:** WeaponKit and SpellKit have run live in Studio play sessions (fire, cast, interrupt) on top of spec-verified validators. CheckpointKit's validators are spec-verified, but it needs a `workspace.Checkpoints` folder with numbered pads to wire up — its `Touched` path warns at boot when the folder is missing. WeaponKit damage-on-hit deserves a two-player live test — solo Studio has nothing to shoot.
 
@@ -1406,7 +1409,7 @@ local Ok, Chunk = Pool:dispatch(chunkX, chunkZ) -- yields until the worker repli
 
 ### Kits
 
-`WeaponKit.service({Weapons, Rewind?, Ammo?})` · `SpellKit.service({Spells, MaxMana?=100, ManaRegenPerSecond?=5})` · `CheckpointKit.service({FolderName?="Checkpoints", MinimumLegitSeconds?=3, StageField?="BestStage"}?)` — each returns a service definition for `kernel:registerService`.
+`WeaponKit.service({Weapons, Rewind?, Ammo?})` · `SpellKit.service({Spells, MaxMana?=100, ManaRegenPerSecond?=5})` · `CheckpointKit.service({FolderName?="Checkpoints", MinimumLegitSeconds?=3, StageField?="BestStage"}?)` · `ProceduralKit.service({Archetypes, RegenSecondsPerModel?=0.25})` — each returns a service definition for `kernel:registerService`. ProceduralKit: `spawn(name, {CFrame?, Size?, Params?, Parent?, Owner?}) -> handle` (`handle:set/patch/resize/regenerate/waitForGeneration/destroy`), `validate(name, params) -> (ok, cleanedOrReason)` for wiring client customization intents.
 
 ```lua
 -- WeaponKit: every field is a server-enforced gate
