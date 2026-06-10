@@ -8,7 +8,7 @@ Roblox game framework with an OS-style architecture: a genre-agnostic kernel (sc
 - Server-authoritative: clients send intents, never state; validation chains are fail-closed; per-channel rate limits; lag-compensated hit validation; movement monitoring.
 - **284 specs** run on every Studio play-test boot. Verification status is documented per feature.
 
-Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/selene) and the Argon or Rojo Studio plugin. License: see [LICENSE.md](https://github.com/1xChloe/ChloeKernel/blob/main/LICENSE.md) — access is **private**, granted individually by Chloe; use in games requires attribution; sharing or redistribution is not permitted.
+Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/selene) and the Argon or Rojo Studio plugin. License: see [LICENSE.md](LICENSE.md) — access is **private**, granted individually by Chloe; use in games requires attribution; sharing or redistribution is not permitted.
 
 ---
 
@@ -1508,7 +1508,7 @@ The full intent security pipeline (rate limit + session check + 3 validators) co
 
 ## License & contributions
 
-ChloeKernel is **private-access** under its own license ([LICENSE.md](https://github.com/1xChloe/ChloeKernel/blob/main/LICENSE.md)) — access is granted individually by Chloe (CryptedChloes on Roblox, 1xChloe on GitHub) and is revocable. The short version, for those granted access:
+ChloeKernel is **private-access** under its own license ([LICENSE.md](LICENSE.md)) — access is granted individually by Chloe (CryptedChloes on Roblox, 1xChloe on GitHub) and is revocable. The short version, for those granted access:
 
 - **Allowed:** use it in your Roblox games, commercial or not; modify it freely inside your own game's codebase
 - **Allowed:** contribute improvements via pull requests to this repository
