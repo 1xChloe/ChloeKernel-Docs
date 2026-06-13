@@ -537,7 +537,7 @@ Rate limiting is automatic (per player, per channel, token bucket). What you add
 Kernel.Bus:subscribe("Net.RateLimited", function(_, player, channelName)
 	noteStrike(player, "rate")
 end)
-Kernel.Bus:subscribe("Net.FloodDetected", function(_, player, bytes)
+Kernel.Bus:subscribe("Net.FloodDetected", function(_, player, bytes, payloadBytes, budgetBytes)
 	-- transport-level flooding (Packet's 8KB/heartbeat cap): heavier hand
 	noteStrike(player, "flood")
 end)
@@ -625,6 +625,7 @@ The Bus's `NetBridge` slot, fulfilled: attach `BusBridge` and marked topics cros
 BusBridge.attach(Kernel, {
 	ServerTopics = { "Round.*", "Combat.Kill" }, -- auto-forward to every client
 	ClientTopics = { "Emote.Play" },             -- EXACT names clients may publish upward
+	ClientSchemas = { ["Emote.Play"] = { "NumberU8" } },
 	RateLimit = 20,                              -- per-player upward budget
 })
 Kernel.Bus:publishRemote("Server.Announcement", "Double XP weekend") -- any topic, explicit
@@ -635,12 +636,14 @@ Kernel.Bus:subscribe("Emote.Play", function(_, session, emoteId) ... end)
 
 ```lua
 -- Client (Bootstrap)
-BusBridgeClient.attach(kernel)
+BusBridgeClient.attach(kernel, {
+	ClientSchemas = { ["Emote.Play"] = { "NumberU8" } },
+})
 kernel.Bus:subscribe("Round.*", function(topic, ...) ... end) -- server events, locally
 kernel.Bus:publishRemote("Emote.Play", 4)                     -- rides the intent pipeline up
 ```
 
-Upward publishes pass the standard gates: per-player rate limit, exact-name whitelist (no wildcards up, fail-closed), and the `Intent.BusPublish` hook chain for game validators. Use one mechanism per topic — a topic in `ServerTopics` that is also `publishRemote`d forwards twice.
+Upward publishes pass the standard gates: per-player rate limit, exact-name whitelist (no wildcards up, fail-closed), typed schemas per topic, and the `Intent.BusPublish.<Topic>` hook chain for game validators. Use one mechanism per topic — a topic in `ServerTopics` that is also `publishRemote`d forwards twice.
 
 ### Send events across servers
 
@@ -1427,11 +1430,11 @@ local AsText = Base64.encode(Blob)        -- for stores that need strings
 | `Net:defineRequest(name, schema, responseSchema, {Handler, RejectValue?, RateLimit?, Open?}?)` · `Net:onRequest(name, fn(session, ...))` | same fail-closed rule; unguarded → `RejectValue` |
 | `Net:auditValidators() → { {Name, Kind} }` | Handler-bearing channels with no validator and no `Open` (i.e. currently rejecting) |
 | `Registry.define(defs)` · `Registry.server(kernel, defs) → handles` · `Registry.client(defs, netClient?) → handles` | Single-source channels; `Validate` rules (Range/OneOf/MaxLength) compile into hook chains; `Open = true` per def for no-auth channels |
-| `BusBridge.attach(kernel, {ServerTopics?, ClientTopics?, RateLimit?=20}?)` · `BusBridgeClient.attach(kernel, netClient?)` | Bus topics across the network; upward publishes are whitelisted + rate-limited |
+| `BusBridge.attach(kernel, {ServerTopics?, ClientTopics?, ClientSchemas?, RateLimit?=20}?)` · `BusBridgeClient.attach(kernel, netClient?, {ClientSchemas?}?)` | Bus topics across the network; upward publishes are whitelisted, typed, and rate-limited |
 | `MessageDriver.new({Codec?, BackoffSeconds?}?)` · `:publish(topic, data) → (ok, err?)` · `:subscribe(topic, fn(data, sentAt?))` | Cross-server events over MessagingService, Serde-packed, 1KB-guarded |
 | `Net:defineUnreliableState(name, structSchema)` · `:sendUnreliableState(name, player, data)` · `:broadcastUnreliableState(name, data)` | Lost > late for high-frequency cosmetic data; ≤900 bytes |
 | `NetClient:onUnreliableState(name, structSchema, fn(data))` | |
-| `Net.Stats` | `IntentsAccepted/Rejected/RateLimited, RequestsRejected` |
+| `Net.Stats` | `IntentsAccepted/Rejected/RateLimited, RequestsRejected, TransportFloods/Bytes` |
 | `NetClient.new()` · `:intent(name, schema) → {fire}` · `:onState(name, schema, fn)` · `:request(name, inSchema, outSchema, {RejectValue?}?) → {invoke}` | A timed-out `invoke` resumes with `RejectValue`, same as a rejection |
 
 Hook points: `Intent.<name>`, `Request.<name>` (fail-closed); `Net.RateLimited`, `Net.FloodDetected` (fail-open). Bus topics: `Intent.<name>`, `Net.IntentRejected`, `Net.RateLimited`, `Net.FloodDetected`.
