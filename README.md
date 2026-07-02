@@ -1,12 +1,10 @@
 # ChloeKernel
 
-> Documentation for [1xChloe/ChloeKernel](https://github.com/1xChloe/ChloeKernel) — the framework source, changelog, and releases live there. This repo carries the docs only; framework access is private, granted individually by Chloe.
-
 Roblox game framework with an OS-style architecture: a genre-agnostic kernel (scheduler, processes, services, IPC, hooks) plus server-side drivers for networking, persistence, replication, anti-exploit, and commerce. Game code registers as services and communicates through kernel primitives; the kernel contains no game rules.
 
 - Priority-scheduled work under a frame budget; buffer-packed serialization at every boundary ([benchmarks](#benchmarks)).
 - Server-authoritative: clients send intents, never state; validation chains are fail-closed; per-channel rate limits; lag-compensated hit validation; movement monitoring.
-- **290 specs** run on every Studio play-test boot. Verification status is documented per feature.
+- **422 specs** run on every Studio play-test boot. Verification status is documented per feature.
 
 Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/selene) and the Argon or Rojo Studio plugin. License: see [LICENSE.md](LICENSE.md) — access is **private**, granted individually by Chloe; use in games requires attribution; sharing or redistribution is not permitted.
 
@@ -33,16 +31,23 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Fire projectiles with travel time](#fire-projectiles-with-travel-time) | [Capture and deduplicate script errors](#capture-and-deduplicate-script-errors) |
 | [Make abilities feel instant](#make-abilities-feel-instant) | [Tune values live without redeploying](#tune-values-live-without-redeploying) |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
-| [React to players entering areas](#react-to-players-entering-areas) | [Write tests](#write-tests) |
+| [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
 | [Run code when a player joins or leaves](#run-code-when-a-player-joins-or-leaves) | [Reuse instances instead of churning them](#reuse-instances-instead-of-churning-them) |
 | [Schedule recurring or background work](#schedule-recurring-or-background-work) | [Survive game updates gracefully](#survive-game-updates-gracefully) |
 | [Run long-lived behaviors you can pause or kill](#run-long-lived-behaviors-you-can-pause-or-kill) | [Run heavy CPU work in parallel](#run-heavy-cpu-work-in-parallel) |
 | [Add keybinds players can remap](#add-keybinds-players-can-remap) | [Queue players into matches](#queue-players-into-matches) |
 | [Decouple systems with events](#decouple-systems-with-events) | [Watch everything live with the debug panel](#watch-everything-live-with-the-debug-panel) |
-| | [Stress-test the kernel with simulation modes](#stress-test-the-kernel-with-simulation-modes) |
+| [Give NPCs brains, aim skill, and movesets](#give-npcs-brains-aim-skill-and-movesets) | [Stress-test the kernel with simulation modes](#stress-test-the-kernel-with-simulation-modes) |
+| [Find paths four different ways](#find-paths-four-different-ways) | [Save player settings and keybinds](#save-player-settings-and-keybinds) |
+| [Track quests from things that happen](#track-quests-from-things-that-happen) | [Ship gameplay analytics](#ship-gameplay-analytics) |
+| [Let players interact with the world](#let-players-interact-with-the-world) | [Audit the security surface in one call](#audit-the-security-surface-in-one-call) |
+| [Scope replicas to zones](#scope-replicas-to-zones) | [Swing hair, capes, and tails](#swing-hair-capes-and-tails) |
+| [Ragdoll bodies that replicate for free](#ragdoll-bodies-that-replicate-for-free) | [Preload assets behind a loading screen](#preload-assets-behind-a-loading-screen) |
+| [Run the whole soundstage](#run-the-whole-soundstage) | |
+| [Animate rigs and blend inverse kinematics](#animate-rigs-and-blend-inverse-kinematics) | |
 
-**Reference:** [API reference](#api-reference) · [Benchmarks](#benchmarks) · [Project layout](#project-layout) · [Roadmap](#roadmap)
+**Reference:** [API reference](#api-reference) · [Hook points & bus topics](#built-in-hook-points--bus-topics) · [Benchmarks](#benchmarks) · [Project layout](#project-layout) · [Roadmap](#roadmap)
 
 ---
 
@@ -833,19 +838,329 @@ if Buffs:has(session, "Chill") then ... end
 
 WalkSpeed recomputes from the humanoid's base across all active effects, so overlapping buffs and removals always land on the right value — and the movement anti-exploit reads live WalkSpeed, so hasted players are never false-flagged.
 
-### React to players entering areas
+### React to players and NPCs entering areas
 
 ```lua
 local Regions = Zones.attach(Kernel)
-Regions:add("SafeZone", workspace.SafeZonePart) -- any invisible part as the volume
 
-Kernel.Bus:subscribe("Zone.Entered", function(_, name, player)
-	if name == "SafeZone" then Buffs:apply(Kernel:getSession(player), "Protected") end
-end)
+-- Per-zone handle: no name-filtering global topics
+local Safe = Regions:add("SafeZone", workspace.SafeZonePart, { -- any invisible part as the volume
+	OnEnter = function(player) Buffs:apply(Kernel:getSession(player), "Protected") end,
+})
+Safe.Left:connect(function(player) Buffs:remove(Kernel:getSession(player), "Protected") end)
+
+-- Or listen globally on the Bus (handlers get the zone name first)
+Kernel.Bus:subscribe("Zone.Entered", function(_, name, player) ... end)
 Kernel.Bus:subscribe("Zone.Left", function(_, name, player) ... end)
 ```
 
-Volume queries on a cadence, not `Touched` — slow walks can't slip through, ragdoll limbs don't double-fire, and leaves always fire before enters on a swap.
+Zones aren't players-only — track NPCs, props, or vehicles and they fire their own events:
+
+```lua
+Regions:track(BossModel)   -- one entity; returns an untrack function
+Regions:trackTag("Enemy")  -- every CollectionService-tagged instance, live
+
+Kernel.Bus:subscribe("Zone.EntityEntered", function(_, name, entity)
+	if name == "Objective" then Alarm:trip(entity) end
+end)
+Regions:entitiesIn("Objective") -- plus :playersIn(name) and :isInside(name, occupant)
+```
+
+Zero-code zones straight from Studio — tag parts and each becomes (or joins) a zone:
+
+```lua
+Regions:addTagged("CKZone") -- zone name = "ZoneName" attribute, falling back to the part's Name
+-- Parts resolving to the same name union into one zone, same as Regions:add("L", { PartA, PartB })
+```
+
+Volume queries on a cadence, not `Touched` — slow walks can't slip through, ragdoll limbs don't double-fire, and leaves always fire before enters on a swap. Destroying (or untagging) a tag-tracked entity fires its leaves immediately; a manually tracked entity that despawns leaves on the next sweep.
+
+### Scope replicas to zones
+
+```lua
+local Regions = Zones.attach(Kernel)
+Regions:add("Dungeon", workspace.DungeonVolume)
+
+local DungeonState = Replicas:create("DungeonState", {
+	Schema = { BossHealth = "NumberU32", Phase = "String" },
+	Data = { BossHealth = 5000, Phase = "Idle" },
+})
+DungeonState:bindZone(Regions, "Dungeon") -- returns an unbind function
+```
+
+Players outside the dungeon pay **zero bytes** for its state. Entering delivers the full snapshot the moment `Zone.Entered` fires — no waiting for the replica's next interest scan — and leaving unsubscribes the same way. The scan stays wired underneath (via `isInside`), so anyone already in the zone when the bind lands still converges.
+
+### Give NPCs brains, aim skill, and movesets
+
+```lua
+local Paths = Pathfinding.attach(Kernel)
+local Arena = Pathfinding.grid({ Origin = Vector3.new(-200, 0, -200), Width = 100, Height = 100, CellSize = 4 })
+local Npcs = NPCKit.attach(Kernel, { Pathfinding = Paths, Grid = Arena, Projectiles = Projectiles, Zones = Regions })
+
+Npcs:define("Cultist", {
+	Model = ServerStorage.NPC.Cultist,
+	Difficulty = "Medium", -- Perfect | HumanPeak | ReallyGood | Good | Medium | Novice | Bad — or a custom table
+	Behaviors = { -- priority list: first behavior whose When passes runs the tick
+		NPCKit.behaviors.attack({ Action = "Firebolt", Range = 60 }),
+		NPCKit.behaviors.chase({ Range = 80, StopRange = 40 }),
+		NPCKit.behaviors.wander({ Radius = 30 }),
+	},
+	Moveset = {
+		-- The SAME projectile definition players fire — one server code path,
+		-- two kinds of trigger finger. The npc handle rides as the owner session.
+		Firebolt = { Kind = "Projectile", DefId = 2, Speed = 120, Cooldown = 3 },
+	},
+})
+
+Npcs:spawn("Cultist", CFrame.new(10, 5, -40))
+Npcs:spawn("Cultist", CFrame.new(30, 5, -60), { Difficulty = "HumanPeak" }) -- per-spawn skill override
+```
+
+NPCs live a little between fights: `NPCKit.behaviors.idle({ Actions = { { Name = "Sleep", Duration = { 4, 9 } }, { Name = "Eat", Weight = 2 } }, Every = { 8, 20 } })` periodically stops the wander for a weighted idle action, publishing `Npc.Idle(npc, action, duration)` / `Npc.IdleEnded` so games hook animations and props; targets and heard sounds interrupt naps instantly. Wander itself validates goals against the grid (up to 8 rolls), so idle strolling never beelines into a wall. NPC-versus-NPC combat is opt-in: mark an archetype `Targetable = true` and every other npc's ordinary acquisition can hunt it (self-targeting is excluded), or override `GetTargets` for full roster control.
+
+Difficulty is nine knobs, not a vibe: **AimErrorDegrees** (per-axis spray), **ReactionSeconds** (delay between noticing and acting), **LeadSkill** (0..1 of the ideal moving-target intercept), **CooldownMultiplier** (attack pace), **HearingMultiplier**, **HearingBlurStuds**, **PathSkill** (routing quality), **DefenseSkill** (0..1 parry/deflect success), and **FieldOfViewDegrees** (the vision cone — `Perfect` scans 360, `Bad` sees 100 in front). `Perfect` is an aimbot, `HumanPeak` is plausible-human-limit, `Bad` can't hit a barn — and a custom table slots anywhere between. The same knobs shape guns, wizard projectiles, and forest creatures alike: `Kind = "Melee"` gates on range and swings `Damage`/`OnHit`, and `Kind = "Custom"` receives a pre-aimed direction so you can point it at the same server function a WeaponKit or SpellKit handler already calls. Behaviors are plain `{ Name, When, Step }` tables — write your own and mix them into the list. Movement re-paths through Pathfinding as the goal moves; with `Zones` attached, spawned models fire `Zone.EntityEntered/Left`. Bus: `Npc.Spawned/Died/Action/Heard`.
+
+NPCs also have **ears**. Player noise alerts them to a location, with accuracy scaled by skill — `Perfect` pinpoints the exact position, `Bad` hears a vague 30-stud blur:
+
+```lua
+local Npcs = NPCKit.attach(Kernel, {
+	Pathfinding = Paths, Grid = Arena,
+	Sounds = {
+		Occlusion = "Path", -- sound goes AROUND obstacles, maze-correct; walls block it.
+		-- "Blocked" = walls stop sound dead; "Through" (default) = walls ignored
+		Topics = { ["Weapon.Fired"] = 60, ["Spell.Cast"] = 30 }, -- player actions that make noise
+	},
+})
+Npcs:emitSound(explosionPosition, { Range = 80, Loudness = 2 }) -- or emit manually
+```
+
+Two more built-in behaviors round out the senses: `NPCKit.behaviors.investigate({ SearchSeconds?, SearchRadius? })` walks to the last heard position and then **searches the area** — the position was vague, so the npc combs `SearchRadius` around it for `SearchSeconds` before giving up (a fresh sound restarts the hunt at the new spot). `NPCKit.behaviors.hide({ SpotTag?, SearchRadius?, Condition? })` breaks the target's line of sight — nearest tagged hiding spot or grid cell the threat can't see, re-picked the moment the spot is compromised. List `hide` first for cowards, or gate it with `Condition` (low health, reloading) for tactical cover.
+
+Delivery mechanics all read the same skill model. `Kind = "Hitscan"` resolves instantly (aim error only, no lead) and publishes `Npc.Hitscan(npc, origin, hitPosition, victim?)` tracers; `Kind = "Projectile"` leads moving targets by `LeadSkill`; adding `Gravity` to the action solves the **ballistic arc** (matching the projectile def's gravity), so lobbers loft over distance and hopeful 45-degree at max range. Routing is skill-tuned too: the new `PathSkill` knob picks any-angle Theta* re-pathed eagerly at the top of the ladder and stale-path A* staircases at the bottom, and every computed route publishes `Npc.Path(npc, waypoints)` for visualization. `npc:setDifficulty("HumanPeak")` swaps the whole model live.
+
+**Sight is a cone, not a sphere.** `npc:canSee(target, maxRange?, fovOverride?)` gates on range, then the skill's `FieldOfViewDegrees` against the rig's actual facing (a cheap dot compare — the raycast only runs for things in frame), then line of sight. Walk past a `Bad` guard's back and it never knows; a `HumanPeak` one covers 270 degrees like it's paid to. Sight-gated targeting (`RequireSight` on `chase`/`attack`) tracks a briefly-occluded target for `MemorySeconds`, then DROPS it and hands the last seen position to the hearing memory — an `investigate` behavior hunts the spot like a soldier instead of pathing omnisciently through walls. Hearing stays omnidirectional, so noise still covers the rear.
+
+**Combat footwork and defense.** `behaviors.strafe({ Near?, Far? })` holds a distance band while cutting sideways on a random flip cadence (pair with a `Passive = true` attack for move-and-shoot); `behaviors.cover({ SpotTag?, SearchRadius?, HoldSeconds?, PeekSeconds?, BackAway? })` runs a hide → hold → peek loop — grid cells the threat can't see, or map-authored **cover nodes**: tag parts `SpotTag`, optionally with a `Direction` attribute (the facing of the wall protecting them) so a node only counts when the threat is on its covered side; squadmates already camping a node push the score down (spread out, don't stack). Every peek starts by **slicing the pie** — `npc:sweep(direction, arc?, rays?, range?)` fans short raycasts across the unseen angle before the body commits. Defense is per-archetype `Reactions`: `Reactions = { Deflect = { Against = { "Hitscan", "Spell" }, Cooldown = 0.8, Difficulty = "HumanPeak", Run = counterVfx } }` — kit `Hitscan`/`Melee` actions roll the victim's matching reaction automatically (attempts consume the cooldown, success rolls `DefenseSkill`, `Npc.Defense(npc, name, success, context)` publishes either way), and `npc:defend(context)` runs the same gauntlet for your own combat code. Per-action `Difficulty` overrides let one body carry Perfect defense and Novice offense.
+
+**Squads: a shared blackboard and a director.** Give archetypes `Faction = "Raiders"` (faction-mates never target each other) and `Squad = "Fireteam"` (auto-join on spawn, or `kit:squad(name):add(npc)`). Members report what their senses actually produced — sight fixes exact, heard positions **blurred by the listener's skill** — into the squad blackboard (`squad:lastKnown(target)`, `npc:lastIntel(target)`); nobody learns anything a squadmate didn't honestly sense. Each tick the director hands the closest engaged member **Pressure** and everyone else on that target **Flank**, publishing `Npc.Tactic(npc, tactic)` so clients play the dive/peek/sprint polish (the server only moves roots and flips states). The consumers: `behaviors.suppress({ Action, Seconds? })` keeps pouring a ranged action at the freshest last-known fix after sight breaks — pinning the spot while a teammate pushes; `behaviors.flank({ StandOff? })` runs only when the director says so, curving to an enfilade point 90 degrees off the pressure axis; `behaviors.flee({ HealthFraction?, SpeedMultiplier? })` outranks everything below the health line and restores the legs on recovery. All of it is combat-agnostic — the same roles drive gunfights, wizard duels, and wolf packs.
+
+**Behavior trees for the strategic layer.** When priority lists stop being enough ("am I suppressed? is a squadmate distracting them? was that corner cleared?"), `BehaviorTree` composes `Selector`/`Sequence` over `Condition`/`Action` leaves with real `Running` semantics — composites remember the running child and resume it next tick instead of re-planning from the top, plus `Invert`/`Succeed`/`Cooldown` decorators and `reset()` to abort a plan. `NPCKit.behaviors.tree(function(npc) return Selector(...) end)` drops a tree into any behavior list; the builder runs once per npc so every brain owns its plan memory. Scale is handled at the kit: `NPCKit.attach(kernel, { Stagger = 3 })` splits the population across ticks (60 brains cost like 20, each bucket stepping with a correctly scaled dt).
+
+### Find paths four different ways
+
+```lua
+local Paths = Pathfinding.attach(Kernel)
+local Grid = Pathfinding.grid({ Origin = Vector3.new(-200, 0, -200), Width = 100, Height = 100, CellSize = 4 })
+
+local Ok, Waypoints = Paths:find({ Method = "AStar", Grid = Grid, Start = A, Goal = B }) -- complete grid search
+Paths:find({ Method = "ThetaStar", Grid = Grid, Start = A, Goal = B }) -- any-angle: best straight lines
+Paths:find({ Method = "Direct", Start = Eye, Goal = Target, Exclude = { Npc.Model } }) -- one raycast: "can I walk at it"
+Paths:find({ Method = "Roblox", Start = A, Goal = B, AgentParams = { AgentRadius = 3 } }) -- engine navmesh; yields
+```
+
+One handler, four methods, each **lazily required on first use** — a game that never calls `AStar` never loads it. AStar/ThetaStar run on a rasterized grid with a `MaxExpansions` budget so a sealed-off goal can't eat the frame; failures return reasons (`GoalBlocked`, `NoPath`, `BudgetExhausted`), and `grid:refresh()` re-rasterizes after the map changes — or `grid:refreshRegion(minWorld, maxWorld)` drops only the cells a moving wall or gate swept, so a course that never stops moving stays cheap. `Roblox` wraps `PathfindingService` when you want the engine navmesh.
+
+Grids account for the real world: the default rasterizer raycasts for **ground** (Terrain, parts, and model geometry all count) and requires the agent-height column above it clear of CanCollide obstacles. Cells carry their ground height, so **waypoints follow elevation**, adjacent cells rising more than `MaxStepHeight` (default 4) read as cliffs, and line of sight refuses to cross walkable high ground — a wall's top surface still occludes. Inject `IsWalkable` (optionally returning a ground Y) for RTS maps, dungeons, or deterministic specs.
+
+### Track quests from things that happen
+
+```lua
+Kernel:registerService(QuestKit.service({
+	Quests = {
+		WolfCull = {
+			AutoAssign = true,
+			Objectives = { { Topic = "Combat.Kill", Count = 5 } },
+			OnComplete = function(session) session.Profile.Data.Coins += 500 end,
+		},
+		Summit = { AutoAssign = true, Objectives = { { Topic = "Zone.Entered", Match = "Peak" } } },
+		DailyObby = { AutoAssign = true, Repeatable = true, Objectives = { { Topic = "Obby.Checkpoint", Count = 10 } } },
+	},
+}))
+
+Kernel.Bus:subscribe("Quest.Progress", function(_, player, questId, index, count, required) ... end)
+Kernel.Bus:subscribe("Quest.Completed", function(_, player, questId) ... end)
+```
+
+A quest is data: objectives count **bus topics the server publishes** ([the catalog](#built-in-hook-points--bus-topics) is the menu), so quests can't be spoofed — there is no client input to validate. By default an event counts for a session when any published arg is that session or its player; `Match` additionally pins an arg (a zone name, a weapon id), and `Filter = fn(session, topic, ...)` takes full control (required for actor-less topics like `Round.PhaseChanged`). Progress persists via `session.Profile` when a DataDriver is attached; `Repeatable` resets to fresh on completion (dailies). `assign`/`abandon`/`progress` on the service handle the rest.
+
+### Let players interact with the world
+
+```lua
+Kernel:registerService(InteractionKit.service({
+	Interactions = {
+		OpenChest = {
+			Tag = "Chest", -- tag parts in Studio; prompts appear (and follow the tag) automatically
+			ActionText = "Open",
+			HoldDuration = 0.5,
+			MaxDistance = 10,
+			Cooldown = 3,
+			LineOfSight = true,
+			OnInteract = function(session, chest) Loot:roll(session, chest) end,
+		},
+	},
+}))
+
+-- Game rules prepend below the kit's gate (priority 50):
+Kernel.Hooks:on("Intent.Interact", function(context)
+	if context.Id == "OpenChest" then return context.Session.Data.HasKey == true end
+end, 10)
+```
+
+A prompt trigger is **client input** — exploit tooling fires prompts from across the map — so every trigger re-validates server-side: distance (with latency slack), line of sight (server raycast, not the prompt's client-side flag), and per-player cooldown, all through the fail-closed `Intent.Interact` chain before `OnInteract` runs. Bus: `Interact.Triggered(session, id, instance)`, `Interact.Rejected(player, id)`.
+
+### Swing hair, capes, and tails
+
+```lua
+-- CLIENT: bones are visual, so the sim runs where the frames are
+local Bones = BonePhysics.attach({ MaxDistance = 100 })
+
+-- Scan a character for boned accessories (layered hair, capes) and bind them
+local Handles = Bones:bindCharacter(Players.LocalPlayer.Character, {
+	Damping = 0.92, Stiffness = 0.1, -- floppiness vs snap-back-to-pose
+})
+
+-- Or a single mesh, or a plain part chain for stud-style tails
+Bones:bind(capeMeshPart, { GravityScale = 1.4 })
+Bones:bindParts({ TailRoot, Seg1, Seg2, Seg3 }, { Stiffness = 0.05 })
+```
+
+A lean verlet bone simulator built for what SmartBone-style modules get wrong: **fixed-timestep** solving (no frame-rate-dependent droop), flat arrays instead of per-bone objects, camera-distance **culling** that snaps back to the pose on wake, a **teleport guard** so respawns don't whip chains across the map, and a leak-free lifecycle — roots auto-unbind on `Destroying`, and poses are written through `Bone.Transform` (the animation slot), never `WorldCFrame`, so `destroy()` hands the skeleton back exactly as it found it. Chain roots stay rig-owned; physics only swings the children.
+
+**Boneless accessories move too.** Most catalog hair has no bones — `bindAccessory` (run automatically by `bindCharacter`) models the accessory as a swing-clamped pendulum hinged at its joint and steers whichever joint kind holds it on: Weld/Motor6D offsets rotate, **RigidConstraint** accessories steer the handle-side Attachment CFrame (nothing swapped or disabled), and WeldConstraints swap for an equivalent local Weld restored exactly on release. `AmbientWind = Vector3` gives the whole sim a procedural gusting breeze with zero wiring — hair drifts, capes breathe. For hanging things (tails, chains), bind with `Stiffness = 0` and let gravity own them; stiffness is pose-hold strength, not springiness.
+
+### Ragdoll bodies that replicate for free
+
+```lua
+-- server
+local Ragdolls = Ragdoll.attach(Kernel, { MaxActive = 16, AutoDeath = true })
+Ragdolls:enable(character, { Duration = 4, Impulse = hitDirection * 40 })
+Ragdolls:release(character) -- restores every joint, socket tune, collision flag, and humanoid state
+
+-- client bootstrap (player characters need the owner-side half)
+RagdollClient.listen(netClient)
+```
+
+Rig-agnostic and build-once: classic rigs swap every enabled `Motor6D` for a `BallSocketConstraint` with per-joint swing/twist limits (necks stay necks, shoulders flop); NEW-format rigs (`AnimationConstraint` joints) just cut the animated joint and **tune the rig's own sockets** — friction (`FrictionTorque`, default 60) and limits go on for the ride and come off on release, because a frictionless free-spinning joint reads as a seizure, not a body. Components build ONCE per model and toggle on re-ragdolls (nothing new replicates), jointed limb pairs get `NoCollisionConstraint`s so bodies drape without self-jitter, limbs gain world collision while the root goes ghost, and `release()` puts back **exactly** what it found.
+
+Player characters get the one thing property replication cannot do: humanoid state is client-authoritative, so the server pushes the `CKRagdoll` state channel and `RagdollClient.listen(netClient)` answers on the owning machine — enters `Physics`, silences the `Animate` script (frozen tracks aren't enough; it keeps starting new ones that wrestle the sockets), and applies the balance-breaking impulses on the assembly it actually simulates. Release re-enables `Animate` fresh, stands the root upright with its yaw kept, kills leftover spin, and gets up — no slanted-walk hangover. Replication costs nothing extra: the swap is server-side and the engine streams the resulting physics like any assembly (the kernel never takes ownership of player characters). `MaxActive` releases the oldest when a pile-up would hurt the server. Bus: `Ragdoll.Started/Ended(model)`.
+
+### Run the whole soundstage
+
+```lua
+-- CLIENT (server-attached AudioKit also works: world sounds replicate)
+local Audio = AudioKit.attach(Kernel)
+Audio:registerBank({
+	Shot = { Id = "rbxassetid://1", Bus = "SFX", Priority = 3, Pooled = true },
+	CaveTheme = { Id = "rbxassetid://2", Bus = "Music", Looped = true, Cues = { Drop = 32.5 } },
+	GuideLine1 = { Id = "rbxassetid://3", Bus = "Voice", Subtitle = "Head for the summit." },
+})
+
+Audio:play("Shot") -- 2D
+Audio:playAt("Shot", muzzlePosition, { Occlusion = "Path", Alert = { Range = 70 } }) -- 3D
+Audio:playMusic("CaveTheme", { Crossfade = 3 })
+Audio:speak("GuideLine1") -- ducks Music/SFX, queues lines, publishes Audio.Subtitle
+
+local Layers = Audio:playLayers({ Calm = "rbxassetid://4", Combat = "rbxassetid://5" }, { StartLayer = "Calm" })
+Layers:setWeights({ Calm = 1, Combat = 0.7 }, 2) -- stems MIX on one locked timeline
+
+Audio:reverbZone(workspace.CaveVolume, Enum.ReverbType.Cave)
+Audio:soundscape({ Bed = "WindLoop", Chirps = { "Bird1", "Bird2" }, Interval = { 4, 12 } })
+Audio:bindSettings(Prefs, { Music = "MusicVolume", SFX = "SfxVolume" }) -- persisted volumes
+```
+
+Everything BetterSound-style modules do, rebuilt on kernel primitives: bus SoundGroups auto-wire, ONE scheduler stepper drives every fade/crossfade/duck (no TweenService churn, no per-sound Heartbeat connections — and the whole engine is deterministic under spec), sounds and 3D emitter parts pool, and channel pressure evicts by priority so a grenade never loses its bang to thirty footsteps. The kernel-only tricks: `Alert` rings NPCKit ears (players' sounds are NPC intel), `Occlusion = "Path"` muffles by the pathfinding route around geometry (the next corridor sounds far, not crystal-clear through the wall), cue points fire loop-aware `Audio.Cue` bus events, and volumes persist through the validated Settings service instead of a raw DataStore. Server triggering: `AudioKit.server(kernel)` gives `broadcast/playFor/broadcastAt`, and clients `audio:listen(netClient)`.
+
+### Animate rigs and blend inverse kinematics
+
+```lua
+local Anims = AnimKit.attach(Kernel)
+Anims:registerBank({
+	Walk = { Id = "rbxassetid://10", Group = "Locomotion" },
+	Run = { Id = "rbxassetid://11", Group = "Locomotion" },
+	Swing = { Id = "rbxassetid://12", Markers = { "Impact" }, Priority = Enum.AnimationPriority.Action },
+})
+
+local Rig = Anims:attachRig(character)
+Rig:play("Walk")
+Rig:play("Run", { Fade = 0.3 }) -- same Group: Walk crossfades out, no T-pose blink
+Kernel.Bus:subscribe("Anim.Marker", function(_, model, animName, marker, param) ... end)
+
+-- IK blends over the keyframes: look at a target, reach for a handle
+local Aim = Rig:ik("Aim", { Type = "LookAt", ChainRoot = waist, EndEffector = head, Target = enemyHead, FadeIn = 0.4 })
+Aim:setWeight(0.5, 0.3)
+Rig:ik("Grab", { Type = "Reach", EndEffector = rightHand, Target = Vector3.new(3, 4, 2) }) -- Vector3 spawns a movable helper
+```
+
+Tracks cache per rig, exclusive groups keep one locomotion clip alive, markers forward to the bus, and the IK layer wraps `IKControl` with the same fade stepper as AudioKit — weights blend in/out instead of snapping, `release()` restores the skeleton, and everything a rig created dies with its model. `Properties` passes raw IKControl overrides for anything the options don't cover, and `assetIds()` feeds the preloader.
+
+### Preload assets behind a loading screen
+
+```lua
+local Warmup = Preload.run(Kernel, {
+	Banks = { Audio, Anims }, -- anything with :assetIds()
+	Assets = { "rbxassetid://999", workspace.Map }, -- extra ids or whole Instances
+})
+Kernel.Bus:subscribe("Preload.Progress", function(_, loaded, total, assetId)
+	LoadingBar.Size = UDim2.fromScale(loaded / total, 1)
+end)
+Kernel.Bus:subscribe("Preload.Done", function(_, loaded, total, failed) LoadingGui:Destroy() end)
+Warmup:await() -- or block a flow until warm
+```
+
+The framework already knows every asset the banks registered — one call warms them in batches, narrates progress on the bus for whatever loading UI you feed it, and collects failures without aborting the pass.
+
+### Save player settings and keybinds
+
+```lua
+-- Server: the schema is the allowlist — clients cannot write anything else
+local Prefs = Settings.attach(Kernel, {
+	Schema = {
+		MusicVolume = { Kind = "number", Min = 0, Max = 1, Default = 0.5 },
+		ShowHints = { Kind = "boolean", Default = true },
+		DashKeys = { Kind = "strings", MaxItems = 2, MaxLength = 20, Default = { "Q" } },
+	},
+})
+Prefs:get(session, "MusicVolume") -- server-side read with defaults
+
+-- Client: fetch once, set optimistically, react to confirmed changes
+local MyPrefs = SettingsClient.new(Net)
+MyPrefs:fetch()
+MyPrefs:set("MusicVolume", 0.8)
+MyPrefs:onChanged(function(key, value)
+	if key == "DashKeys" then Input:rebind("Dash", toKeyCodes(value)) end
+end)
+```
+
+Writes ride a rate-limited intent through the fail-closed chain: unknown keys reject, numbers **clamp** into `Min/Max`, strings cap at `MaxLength`, and string arrays are **rebuilt clean** so hidden hash keys never reach storage. Values persist via the DataDriver profile (pre-profile writes merge in, player's choice wins) and `Settings_Sync` pushes the authoritative value back so an out-of-range optimistic set self-corrects. Bus: `Settings.Changed(session, key, value)` — wire it to InputDriver `rebind` and remaps survive rejoins.
+
+### Ship gameplay analytics
+
+```lua
+local Events = Analytics.attach(Kernel, {
+	MaxPerMinute = 120, -- protects Roblox's custom-event budget
+	Sample = { PositionPing = 0.1 }, -- keep 10% of chatty events
+	WatchErrors = true, -- bridge Kernel.ScriptError automatically
+})
+Events:track("RoundFinished", winner, roundNumber)
+Events:track("BossKilled", killer, 1, { CustomField01 = bossName })
+```
+
+`track()` is a queue insert; a background flush batches to `AnalyticsService:LogCustomEvent` — funnels and retention with zero external infrastructure — or to an injected `Destination` (webhook, warehouse). Over-cap and sampled-out events **drop and are counted** in `Stats`, never silently; a crashing destination loses only its own batch.
+
+### Audit the security surface in one call
+
+```lua
+Kernel:securityAudit()
+-- [High]   UnguardedChannel — intent Grant: has a handler but no validator ...
+-- [High]   FailOpenGate — hook Intent.Buy: guards a channel but is FailOpen ...
+-- [Medium] OpenChannel — intent ReadyUp: any client payload reaches the handler ...
+-- [Info]   DefaultRateLimit — intent Chat: rides the default rate limit (30/s) ...
+
+local Findings = Kernel:securityAudit({ Silent = true }) -- CI-style gate
+assert(#Findings == 0, "ship blocked: security audit found issues")
+```
+
+One post-boot sweep over every assumption the security model makes: handler-bearing channels with no validator, `Open = true` escape hatches (by design, but confirm each survives hostile input), gate hook points flipped `FailOpen` (a crashing validator would PASS payloads), and channels still on the default rate limit. Sorted most severe first; `auditValidators()` remains the narrow unguarded-only sweep.
 
 ### Show stats on the leaderboard
 
@@ -996,7 +1311,7 @@ Kernel:registerService(WeaponKit.service({
 | **RoundKit** | — (replica out) | phase cycle, duration timers, MinPlayers gates, countdown replication | `Round.PhaseChanged` |
 | **ProceduralKit** | — (wire yours through `service:validate`) | runtime ProceduralModel spawning, fail-closed parameter validation (type/Min/Max/OneOf), per-model regeneration rate limiting with batched flushes, session-bound lifecycle | `Procedural.Spawned/Updated/Rejected/Removed` |
 
-All kit validation lives in the same fail-closed hook chains (`Intent.WK_Fire`, `Intent.SK_Cast`, `Intent.Checkpoint`) — prepend your own rules at lower priority numbers without forking the kit.
+All kit validation lives in the same fail-closed hook chains (`Intent.WK_Fire`, `Intent.SK_Cast`, `Intent.Checkpoint`, `Intent.Interact`, `Intent.Settings_Set`) — prepend your own rules at lower priority numbers without forking the kit. Beyond the combat kits: [QuestKit](#track-quests-from-things-that-happen) (declarative objectives off bus topics), [InteractionKit](#let-players-interact-with-the-world) (exploit-proof prompts), and [NPCKit](#give-npcs-brains-aim-skill-and-movesets) (behavior lists, difficulty presets, player-unified movesets).
 
 > **ProceduralKit** rides Roblox's ProceduralModels (Studio beta; works in live games when the beta ships): parameter-driven Models whose server-side Generator ModuleScript rebuilds their geometry when Size or an attribute changes. The peer that changes a parameter generates — server writes generate server-side and replicate the results, so generators stay in ServerScriptService where exploiters can't decompile them. The kit validates and clamps every parameter (unknown names and wrong types reject outright), buffers writes behind a per-model cooldown so a spammed customization intent costs one rebuild per window instead of one per message, and ships an ExampleGenerator demonstrating the two generator survival habits: `params:Pause()` in loops (the engine kills generators that work too long without yielding) and deriving ALL randomness from a Seed attribute (every rebuild reruns the generator — unseeded randomness reshuffles the model on every parameter change).
 
@@ -1218,7 +1533,8 @@ ServerScriptService.ChloeKernelServer   NEVER replicates — everything privileg
 src/
 ├── Shared/                       → ReplicatedStorage
 │   └── ChloeKernel/               microkernel: Scheduler, Process, ServiceManager,
-│                                 Logger, GcWatch, Serde, Base64, InputDriver, IPC/, Hooks/,
+│                                 Logger, GcWatch, Serde, Base64, InputDriver, BonePhysics,
+│                                 AudioKit, AnimKit, Preload, IPC/, Hooks/,
 │                                 Net/ (NetClient, ReplicaClient, TokenBucket,
 │                                 Packet/ — wire transport ported from Packet v1.7
 │                                 by Suphi Kaner; CREDITS.md lists local fixes),
@@ -1231,8 +1547,9 @@ src/
 │                                 MessageDriver, Data/ (DataDriver, MemoryDriver,
 │                                 backends), AntiExploit/ (Movement, Rewind),
 │                                 Commerce/ (Receipts, Transactions), Kits/,
-│                                 Simulation/, Matchmaking, SoftShutdown,
-│                                 ActorPool/, Tests/
+│                                 Pathfinding/ (AStar, ThetaStar, Direct, Roblox),
+│                                 Settings, Analytics, Zones, Ragdoll, Simulation/,
+│                                 Matchmaking, SoftShutdown, ActorPool/, Tests/
 └── Client/
     ├── Main.client.luau          boot → Bootstrap → start
     └── Bootstrap.luau            YOUR client wiring registers here
@@ -1276,6 +1593,7 @@ Everything above, plus:
 | `kernel:getSession(player) → Session?` | |
 | `kernel:net() → NetDriver` | Lazy singleton |
 | `kernel:stats()` | Adds `Sessions` count and `Net` counters |
+| `kernel:securityAudit({Silent?}?) → {AuditFinding}` | One pre-ship sweep: unguarded channels, `Open` escape hatches, fail-open gate hooks, defaulted rate limits — prints a summary (unless Silent) and returns `{Severity, Kind, Name, Detail}` findings, most severe first |
 
 **Session**: `.Player`, `.Data` (per-visit scratch), `.Profile` (persistent; set by `DataDriver:attach`), `.Active`, `.OnEnd`; `session:bind(x)` auto-tears-down connections, instances, functions, and disconnectables.
 
@@ -1334,6 +1652,7 @@ Proc.OnExit:connect(function(state, result) print(state, result) end)
 | `HookRegistry.new({WarnOnError?})` · `:definePoint(name, {FailOpen?})` | Points default fail-closed |
 | `hooks:on(name, fn, priority?) → disconnectFn` | Default priority 100; ties keep registration order |
 | `hooks:fire(name, context?) → (passed, context)` | |
+| `hooks:listPoints() → { {Name, FailOpen, Handlers} }` | Point snapshot for audits/debug tooling |
 
 ```lua
 local Sig = Signal.new()
@@ -1347,6 +1666,76 @@ local Off = Kernel.Hooks:on("Intent.Jump", function(context)
 end)
 Off() -- handlers return their own disconnect function
 ```
+
+### Built-in hook points & bus topics
+
+The two systems answer different questions. **Hooks** ask permission: handlers run in priority order, share one mutable `context` table, and any `false` return (or error, unless the point is `FailOpen`) cancels the action. **Bus topics** announce facts: handlers get `(topic, ...)`, run independently, and cannot cancel anything. Both registries create points and topics on first use, so your own names cost nothing to add.
+
+**Hook points fired by the framework** (all server-side):
+
+| Point | Context | Mode | Fired |
+|---|---|---|---|
+| `Intent.<Channel>` | `{Name, Player, Session, Args, Seq?}` | fail-closed | Before every intent handler. Validators may rewrite `Args` (clamp, normalize) — the handler receives the mutated copy |
+| `Request.<Channel>` | `{Name, Player, Session, Args}` | fail-closed | Before every request handler; a rejection answers the client with the channel's `RejectValue` |
+| `Intent.BusPublish.<Topic>` | `{Name, Player, Session, Args}` | fail-closed | Client-to-server bus publish (BusBridge), after the exact-name whitelist and rate limit |
+| `Session.Start` / `Session.End` | `{Session, Player}` | observational | Player join/leave. The kernel ignores the verdict, but handlers run synchronously before the matching bus topic — seed per-player state here and bus subscribers already see it |
+| `Net.RateLimited` | `{Player, Channel}` | fail-open | A channel's token bucket rejected a message |
+| `Net.FloodDetected` | `{Player, Bytes, PayloadBytes, BudgetBytes}` | fail-open | The transport dropped a client that blew its byte budget |
+| `AntiExploit.MovementViolation` | `{Player, Session, Type, HorizontalSpeed, Displacement, Strikes}` | fail-open | A movement sample failed validation |
+| `Intent.Interact` | `{Session, Player, Id, Instance, Definition}` | fail-closed | Every prompt trigger (InteractionKit); the kit's distance/line-of-sight/cooldown gate sits at priority 50 |
+
+Kit channels are ordinary intents, so their points follow the same shape — `Intent.WK_Fire`, `Intent.SK_Cast`, `Intent.Checkpoint`, `Intent.Settings_Set` — and you prepend rules at lower priority numbers without forking the kit.
+
+**Bus topics published by the framework.** Handlers receive `(topic, ...)`; the args below follow the topic name.
+
+| Topic | Args | Published when |
+|---|---|---|
+| `Kernel.SessionStart` / `Kernel.SessionEnd` | `session` | Join/leave; `SessionEnd` fires before the session object is destroyed, so bound state is still readable |
+| `Kernel.ProfileLoaded` | `session, profile` | DataDriver finished loading a player's profile |
+| `Kernel.ProfileRestored` | `session, profile` | A corrupt or unmigratable record was restored from backup — tell the player, ping your webhook |
+| `Kernel.ScriptError` | `message, trace, source, count` | ErrorWatch captured (or re-counted) a script error |
+| `Kernel.Overload` | `statsSnapshot` | Diagnostics saw deferred work three windows in a row — the scheduler is saturated |
+| `Kernel.SoftShutdown` | `playerCount` | Update migration is about to teleport everyone out |
+| `Intent.<Channel>` | `session, ...validatedArgs` | AFTER an accepted intent ran — the observational twin of the hook chain |
+| `Net.IntentRejected` | `player, channelName` | A validator, missing guard, or crashing handler rejected an intent |
+| `Net.RateLimited` | `player, channelName` | Token bucket rejection |
+| `Net.FloodDetected` | `player, bytes, payloadBytes, budgetBytes` | Transport-level flood drop |
+| `Zone.Entered` / `Zone.Left` | `zoneName, player` | A player crossed a zone boundary (leaves fire before enters) |
+| `Zone.EntityEntered` / `Zone.EntityLeft` | `zoneName, entity` | A tracked entity (NPC, prop, vehicle) crossed a zone boundary |
+| `Effects.Applied` | `player, effectName, stacks` | Effect applied or stacked |
+| `Effects.Expired` | `player, effectName` | Effect expired or was removed |
+| `Round.PhaseChanged` | `phaseName, duration` | RoundKit advanced a phase |
+| `Projectile.Hit` | `ownerSession, victim, defId, position` | A server-simulated projectile landed |
+| `Config.Changed` | `key, value` | LiveConfig saw a new value (local `set` or remote poll) |
+| `Obby.Checkpoint` | `player, stage` | CheckpointKit accepted a checkpoint |
+| `Spell.Cast` / `Spell.Interrupted` | `session, spellId` | SpellKit outcome |
+| `Weapon.Fired` / `Weapon.Hit` | `(session, weaponId, origin, direction)` / `(session, victim, weaponId, position)` | WeaponKit accepted a shot / landed a hit |
+| `Weapon.ShotRejected` | `player, reason` | WeaponKit refused a shot |
+| `Procedural.Spawned/Updated/Rejected/Removed` | see [ProceduralKit](#proceduralkit-parametric-geometry-end-to-end) | Runtime geometry lifecycle |
+| `Quest.Progress` | `player, questId, objectiveIndex, count, required` | An objective advanced |
+| `Quest.Completed` | `player, questId` | Every objective met (Repeatable quests reset after) |
+| `Interact.Triggered` / `Interact.Rejected` | `(session, id, instance)` / `(player, id)` | A prompt interaction passed / failed validation |
+| `Npc.Spawned` / `Npc.Died` | `npc` | NPCKit lifecycle (`Died` precedes the despawn delay) |
+| `Npc.Action` | `npc, actionName, target` | A moveset action executed |
+| `Npc.Heard` | `npc, heardPosition, source?` | A sound survived range/occlusion for this npc (position pre-blurred by its skill) |
+| `Npc.Idle` / `Npc.IdleEnded` | `(npc, actionName, duration)` / `(npc, actionName)` | An idle action (sleeping, eating) started / finished — hook animations here |
+| `Npc.Path` | `npc, waypoints` | A new route was computed (full list, own position first) — hook for path visualization |
+| `Npc.Hitscan` | `npc, origin, hitPosition, victim?` | A hitscan action fired (hit or miss) — hook for tracers |
+| `Npc.Defense` | `npc, reactionName, success, context` | A defensive reaction attempt (deflect flash or fumble — hook VFX here) |
+| `Npc.Tactic` | `npc, tactic` | Director/behavior state flip: `Pressure`/`Flank`/`Suppress`/`Cover`/`Peek`/`Flee` — hook client animation polish |
+| `Ragdoll.Started` / `Ragdoll.Ended` | `model` | A ragdoll engaged / restored |
+| `Audio.Cue` | `soundName, cueName, handle` | Playback crossed a registered cue time (loop-aware) |
+| `Audio.Subtitle` / `Audio.SubtitleEnded` | `(text, duration)` / `()` | Dialogue line started / finished — wire your subtitle UI here |
+| `Anim.Marker` | `model, animName, markerName, param` | An animation marker fired on a rig |
+| `Preload.Started` / `Preload.Progress` / `Preload.Done` | `(total)` / `(loaded, total, assetId, ok)` / `(loaded, total, failed)` | Asset warm-up lifecycle — wire your loading screen here |
+| `Settings.Changed` | `session, key, value` | A setting was written (client intent or server `set`) |
+| `Matchmaking.Queued` / `Dequeued` | `player, queueName` | Queue membership changed |
+| `Matchmaking.MatchFound` / `TeleportFailed` | `queueName, members` | Match lifecycle |
+| `Commerce.PurchaseGranted` | `player, productId, purchaseId` | A receipt was processed (exactly once per purchase) |
+| `AntiExploit.MovementViolation` | `player, violationType, strikes` | A movement strike was recorded |
+| `Input.<Action>` | `state, inputObject` | **Client-side** — an InputDriver action changed state |
+
+One topic is consumed rather than published: publish **`AntiExploit.Forgive`** with `(player)` right before a legit server-side teleport and the next movement sample is pardoned.
 
 ### Logger
 
@@ -1460,6 +1849,7 @@ Net:onState("WeatherChanged", { "NumberU8" }, setWeatherVfx)
 | `ReplicaService.new(kernel)` | |
 | `service:create(name, {Schema, Data, TickRate?=10, Interest?, Quantize?}) → replica` | `Quantize = {[field] = threshold}` deadbands numeric/vector fields against the last replicated value |
 | `replica:set(key, value)` · `:patch(table)` · `:get(key)` · `:destroy()` | Dirty fields coalesce per tick |
+| `replica:bindZone(zones, zoneName) → unbind` | Zone-scoped interest: `Zone.Entered/Left` flips subscription instantly (snapshot on entry, remove on exit); the interest scan agrees via `isInside` |
 | `ReplicaClient.new()` · `:listen(name, schema, fn(replica))` | Early packets buffered until listen |
 | client replica: `.Data`, `.OnChange(key, new, old)`, `.OnRemove` | |
 
@@ -1611,6 +2001,14 @@ local Ok, Chunk = Pool:dispatch(chunkX, chunkZ) -- yields until the worker repli
 
 `WeaponKit.service({Weapons, Rewind?, Ammo?})` · `SpellKit.service({Spells, MaxMana?=100, ManaRegenPerSecond?=5})` · `CheckpointKit.service({FolderName?="Checkpoints", MinimumLegitSeconds?=3, StageField?="BestStage"}?)` · `ProceduralKit.service({Archetypes, RegenSecondsPerModel?=0.25})` — each returns a service definition for `kernel:registerService`. ProceduralKit: `spawn(name, {CFrame?, Size?, Params?, Parent?, Owner?}) -> handle` (`handle:set/patch/resize/regenerate/waitForGeneration/destroy`), `validate(name, params) -> (ok, cleanedOrReason)` for wiring client customization intents.
 
+`QuestKit.service({Quests, Field?="Quests"})` — quest: `{Objectives = {{Topic, Count?=1, Match?, Filter?}}, AutoAssign?, Repeatable?, OnComplete?}`; service `:assign(session, id)` · `:abandon` · `:progress(session, id) → {Done, Objectives}?`; Bus `Quest.Progress/Completed`.
+
+`InteractionKit.service({Interactions, GetDistance?, HasLineOfSight?})` — interaction: `{Tag, ActionText?, ObjectText?, HoldDuration?, MaxDistance?=10, Cooldown?, LineOfSight?, OnInteract?}`; prompts follow CollectionService tags; every trigger re-validates through `Intent.Interact` (kit gate at priority 50); Bus `Interact.Triggered/Rejected`.
+
+`NPCKit.attach(kernel, {Pathfinding?, Grid?, PathMethod?, Projectiles?, Zones?, Container?, TickSeconds?=0.15, Stagger?=1, Seed?, GetTargets?, Clock?, Sounds?, HasLineOfSight?, Raycast?})` — `:define(name, {Model?, Health?, WalkSpeed?, Difficulty?="Medium", Behaviors, Moveset?, Reactions?, DespawnSeconds?=3, Targetable?, Faction?, Squad?, GetPosition?, Move?})` · `:spawn(name, cframeOrPosition, {Difficulty?, Squad?}?) → npc` · `:squad(name) → squad` · `:emitSound(position, {Range?=40, Loudness?, Source?}?)` · `:hasLineOfSight(from, to)` · `:count()` · `:destroy()`. `Sounds = {Occlusion? = "Through"/"Blocked"/"Path", Topics? = {[busTopic] = range}}`. Npc: `:position()` · `:facing()` · `:canSee(target, maxRange?, fov?)` · `:sweep(direction, arc?=90, rays?=5, range?=24) → Model?` · `:aimAt(pos, velocity?, speed?, gravity?, skill?) → direction` · `:act(name, target?) → bool` · `:defend(context) → bool` · `:lastIntel(target)` · `:updateTarget(acquire, giveUp, {RequireSight?, MemorySeconds?}?)` · `:moveTowards(goal)` · `:canReact()` · `:setDifficulty(nameOrTable)` · `:destroy()`. Squad: `:report(npc, target, position, velocity?)` · `:lastKnown(target)` · `:role(npc)` · `:add/remove(npc)`. Actions: `{Kind = "Projectile"/"Hitscan"/"Melee"/"Custom", Difficulty?, Cooldown?, DefId?, Speed?, Gravity?, Range?, Damage?, OnHit?, Run?}`; Reactions: `{Against?, Cooldown?=1, Difficulty?, Run?}`. Difficulty presets `NPCKit.Difficulties.{Perfect,HumanPeak,ReallyGood,Good,Medium,Novice,Bad}` = `{AimErrorDegrees, ReactionSeconds, LeadSkill, CooldownMultiplier, HearingMultiplier, HearingBlurStuds, PathSkill, DefenseSkill, FieldOfViewDegrees}`; behavior factories `NPCKit.behaviors.{wander,idle,chase,attack,strafe,cover,investigate,hide,suppress,flank,flee,tree}`. Bus `Npc.Spawned/Died/Action/Heard/Idle/Path/Hitscan/Defense/Tactic`.
+
+`BehaviorTree` (Kits/BehaviorTree) — `Selector(name?, children)` · `Sequence(name?, children)` · `Condition(name?, check)` · `Action(name?, run)` (nil return = Success) · `Invert/Succeed(child)` · `Cooldown(seconds, child)` · `tick(root, blackboard, dt) → "Success"/"Failure"/"Running"` · `reset(root)`. Composites resume `Running` children in place. Adapter: `NPCKit.behaviors.tree(build, {Name?, Passive?}?)` — `build(npc)` runs once per npc (private plan memory).
+
 ```lua
 -- WeaponKit: every field is a server-enforced gate
 Kernel:registerService(WeaponKit.service({
@@ -1660,11 +2058,19 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `ProjectileClient.new({[id] = {Gravity?, Create, OnImpact?}})` | Pooled client visuals, same math as the server |
 | `Effects.attach(kernel)` · `:define(name, {Duration?, MaxStacks?=1, Stats? = {[stat]=multiplier}, OnApply?, OnExpire?})` · `:apply(session, name, {Duration?}?) → stacks` · `:remove` · `:has` · `:stacks` · `:statMultiplier(session, stat) → number` | Humanoid stats auto-applied; Bus `Effects.Applied/Expired` |
 | `Prediction.wrap(net, name, schema, {Predict?, TimeoutSeconds?=2}) → {fire → seq, OnResolved}` | Pairs with `Net:definePredictedIntent(name, schema, opts)` |
-| `Zones.attach(kernel, {IntervalSeconds?=0.25}?)` · `:add(name, part)` · `:remove(name)` · `:playersIn(name)` | Bus `Zone.Entered/Left` (leaves before enters) |
+| `Zones.attach(kernel, {IntervalSeconds?=0.25}?)` · `:add(name, part or {parts}, {OnEnter?, OnLeave?}?) → handle` · `:addPart(name, part)` · `:remove(name)` · `:addTagged(tag, {NameAttribute?="ZoneName"}?) → stop` · `:track(entity) → untrack` · `:trackTag(tag) → stop` · `:untrack(entity)` · `:playersIn(name)` · `:entitiesIn(name)` · `:isInside(name, occupant)` | Handle carries `Entered`/`Left` Signals firing `(occupant)`; Bus `Zone.Entered/Left` `(name, player)` for players, `Zone.EntityEntered/EntityLeft` `(name, entity)` for tracked entities (leaves before enters). `addTagged` builds zones from CollectionService tags — same-named parts union into one multi-part zone |
 | `Leaderstats.attach(kernel, {Display = {Field, From?, Kind?}}, opts?)` | Values track data on a 1s sweep |
 | `Pool.new({Create, InitialSize?})` · `:acquire()` · `:release(instance)` · `:idleCount()` · `:destroy()` | |
 | `ErrorWatch.attach(kernel?, {WindowSeconds?=30}?)` · `:counts()` | Bus `Kernel.ScriptError(message, trace, source, count)` |
 | `LiveConfig.new(kernel, {Defaults, PollSeconds?=30})` · `:get(key)` · `:set(key, value)` | Bus `Config.Changed(key, value)`; `set(key, nil)` deletes the override and every server reverts to its default |
+| `Pathfinding.attach(kernel?)` · `:find({Method?="Direct", Start, Goal, Grid?, MaxExpansions?, Exclude?, AgentParams?}) → (ok, waypointsOrReason)` · `Pathfinding.grid({Origin, Width, Height, CellSize?=4, AgentHeight?=6, MaxStepHeight?=4, IsWalkable?}) → grid` · `grid:refresh()` · `grid:refreshRegion(minWorld, maxWorld)` · `grid:groundY(x, z)` | Methods `AStar`/`ThetaStar`/`Direct`/`Roblox`, lazily required; failures return reasons (`GoalBlocked`, `NoPath`, `BudgetExhausted`, ...); `Roblox` yields. Default rasterizer raycasts ground (Terrain + parts), waypoints ride elevation, `MaxStepHeight` refuses cliffs and lets walkable high ground occlude line of sight |
+| `Settings.attach(kernel, {Schema, Field?="Settings", RateLimit?=10})` · `:get(session, key)` · `:all(session)` · `:set(session, key, value)` · rule: `{Kind = "number"/"boolean"/"string"/"strings", Default, Min?, Max?, MaxLength?=64, MaxItems?=8}` | Allowlisted client writes: clamp/cap/rebuild through `Intent.Settings_Set`; persists via profile; Bus `Settings.Changed`. Client: `SettingsClient.new(net)` · `:fetch()` · `:get` · `:set` · `:onChanged(fn)` |
+| `Analytics.attach(kernel, {FlushSeconds?=10, MaxPerMinute?=120, Sample?, Destination?, WatchErrors?, Seed?}?)` · `:track(name, player?, value?, fields?) → bool` · `:stats via .Stats` · `:destroy()` (flushes) | Batched to `AnalyticsService:LogCustomEvent` or an injected destination; sampled/over-cap drops counted, never silent |
+| `BonePhysics.attach({Gravity?, Wind?, FixedHz?=60, MaxSubsteps?=3, MaxDistance?=100, ShouldSimulate?}?)` · `:bind(part, {Damping?=0.92, Stiffness?=0.1, GravityScale?, WindScale?}?) → handle?` · `:bindParts({parts}, settings?)` · `:bindCharacter(model, settings?) → {handles}` · `:step(dt)` · `handle:destroy()` · `:destroy()` | Client-side verlet bone chains (shared module, `ReplicatedStorage.ChloeKernel.BonePhysics`); fixed timestep, culling with pose snap-back, teleport guard, Transform-slot writes, Destroying auto-unbind |
+| `Ragdoll.attach(kernel, {MaxActive?=16, AutoDeath?, CollisionGroup?, FrictionTorque?=60}?)` · `:enable(model, {Duration?, Impulse?}?) → bool` · `:release(model)` · `:isRagdolled(model)` · `:destroy()` — clients: `RagdollClient.listen(netClient)` | Build-once/toggle: Motor6D→limited BallSocket swap or AnimationConstraint cut with native-socket friction/limit tuning, NoCollision limb pairs, full restore; owner-client `CKRagdoll` push flips humanoid state, silences Animate, applies impulses, uprights on release; Bus `Ragdoll.Started/Ended` |
+| `AudioKit.attach(kernel, {Buses?, MaxChannels?=32, Parent?, Npcs?, Occlusion = {GetListener?, IsBlocked?, Pathfinding?, Grid?}?}?)` · `:register/registerBank` · `:play(name, opts?) → handle` · `:playAt(name, target, opts?)` · `:playMusic` · `:playLayers → {setWeights, resync, stop}` · `:speak` · `:duck(bus, scale) → release` · `:setBusVolume` · `:bindSettings(prefs, map)` · `:reverbZone(part, type)` · `:soundscape` · `:assetIds()` · `:destroy()`; `AudioKit.server(kernel) → {broadcast, playFor, broadcastAt}` · `audio:listen(netClient)` | Bank config: `{Id, Bus?, Volume?, Speed?, Looped?, Priority?, Pooled?, RollOff*, Cues?, Subtitle?, Duck?}`; handle: `stop(fade?)/setVolume/setSpeed`. Bus events `Audio.Cue/Subtitle/SubtitleEnded` |
+| `AnimKit.attach(kernel, {LoadTrack?}?)` · `:register/registerBank` (`{Id, Priority?, Speed?, FadeIn?, Looped?, Group?, Markers?}`) · `:attachRig(model) → rig` · `:assetIds()` · `:destroy()`; rig: `:play(name, {Fade?, Speed?, Weight?})` · `:stop/stopAll/setSpeed` · `:ik(name, {Type = "LookAt"/"Reach"/"Transform"/"Rotation", Target, ChainRoot?, EndEffector?, Weight?, FadeIn?, Properties?}) → {Control, setWeight, setTarget, release}` · `:destroy()` | Exclusive `Group`s crossfade; markers publish `Anim.Marker`; IK weights blend on the kit stepper; rigs die with their model |
+| `Preload.run(kernel, {Assets?, Banks?, BatchSize?=16}?) → {Done, Loaded, Total, Failed, await()}` | Batched `PreloadAsync`; Bus `Preload.Started/Progress/Done`; failures collect, never abort |
 
 ### TestKit / Bench
 
