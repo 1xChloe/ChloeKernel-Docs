@@ -44,7 +44,7 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Let players interact with the world](#let-players-interact-with-the-world) | [Audit the security surface in one call](#audit-the-security-surface-in-one-call) |
 | [Scope replicas to zones](#scope-replicas-to-zones) | [Swing hair, capes, and tails](#swing-hair-capes-and-tails) |
 | [Ragdoll bodies that replicate for free](#ragdoll-bodies-that-replicate-for-free) | [Preload assets behind a loading screen](#preload-assets-behind-a-loading-screen) |
-| [Run the whole soundstage](#run-the-whole-soundstage) | |
+| [Run the whole soundstage](#run-the-whole-soundstage) | [Scale effects to the device](#scale-effects-to-the-device) |
 | [Animate rigs and blend inverse kinematics](#animate-rigs-and-blend-inverse-kinematics) | |
 
 **Reference:** [API reference](#api-reference) · [Hook points & bus topics](#built-in-hook-points--bus-topics) · [Benchmarks](#benchmarks) · [Project layout](#project-layout) · [Roadmap](#roadmap)
@@ -1135,6 +1135,40 @@ Warmup:await() -- or block a flow until warm
 
 The framework already knows every asset the banks registered — one call warms them in batches, narrates progress on the bus for whatever loading UI you feed it, and collects failures without aborting the pass.
 
+### Scale effects to the device
+
+```lua
+-- CLIENT, during the loading screen: Preload warms assets on the network,
+-- the bench uses the idle CPU
+local Bench = DeviceBench.run({ BudgetMs = 90, Bus = Kernel.Bus })
+print(Bench.Quality) -- continuous 0.25..4, decimals allowed (1 = mid-range reference)
+print(Bench.Axes) -- e.g. { Compute = 2.1, Churn = 3.4, Resume = 1.6 }
+
+-- Budgets are funded PER AXIS: the workload a device is good at pays for the
+-- systems that stress it. Strong Churn buys particles and vfx density; strong
+-- Compute buys bone chains and projectile visuals; strong Resume buys channels.
+local Quality = DeviceBench.profile() -- computed from the benched axes
+Emitter.Rate = BaseRate * Quality.VfxDensity
+Lighting.GlobalShadows = Quality.ShadowsEnabled
+
+-- Map the continuous quality onto your own knobs (log-mapped: every doubling
+-- of device quality buys the same slice of the range) — or ask for any exact
+-- quality point, decimals included
+local ViewDistance = DeviceBench.scale(80, 500)
+local Handcrafted = DeviceBench.profile(1.35)
+local MaxRagdolls = DeviceBench.pick({ Low = 4, High = 16 }) -- coarse tiers remain a convenience
+
+-- Stability outranks beauty: hold 60fps, nudging the effective quality down
+-- ~20% on sustained misses and gently back up with headroom, never past the bench
+DeviceBench.governor({ TargetFps = 60, Bus = Kernel.Bus, OnChange = function(quality, profile)
+	applyQuality(profile)
+end })
+```
+
+A one-shot **mini benchmark** answers "how fast is this device" so quality stops being one-size: three time-boxed Luau workloads — compute, allocation churn, and coroutine resumes (how quick the client's threads actually run) — each become a continuous **0.25..4 axis multiplier** against a mid-range reference, decimals fully allowed, and their geometric mean is the overall `Quality`. Time-boxed means a weak device runs fewer iterations in the same ~90ms instead of hitching longer. The result caches (`Force` re-measures), optionally publishes `Device.Benchmarked`, and includes `Platform` plus an optional median `FrameMs`.
+
+`DeviceBench.profile()` computes **granular budgets from the axes** — no tier cliffs, and each knob scales by the axis that pays its cost, so a device that benched 3.4x on churn but 1.2x on compute gets near-max particle budgets while bone chains stay modest. It accepts a `Result`, any quality number (`profile(1.35)` is a real point, not a rounded tier), or a tier name for coarse use; `Low`/`Medium`/`High`/`Ultra` remain as a convenience over the continuous scale for `pick()`. Framework client modules consume the profile when you don't configure them: BonePhysics defaults its cull `MaxDistance` to `BoneDistance` and its simultaneous chain budget `MaxChains` to `BoneChains`, AudioKit its `MaxChannels` to `AudioChannels`, ProjectileClient its `MaxVisuals` render cap to `ProjectileVisuals` — every default is an option you can override, and the caps are purely cosmetic (a capped projectile still hits, a capped chain freezes at its pose). The **governor** keeps it honest at runtime: it watches p95 frame times against `TargetFps` (default 60 — hold that before beauty), multiplies the effective quality by 0.8 after ~3s of sustained misses and by 1.15 after ~10s of clear headroom — granular nudges, not tier jumps — never past what the bench measured, and its profiles preserve the device's axis ratios, so a churn-strong device dialed down still favors its particles. Changes arrive via `OnChange(quality, profile)` and `Device.QualityChanged`. All of it is a **client measurement**: perfect for cosmetics, never authority.
+
 ### Save player settings and keybinds
 
 ```lua
@@ -2083,7 +2117,7 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 |---|---|
 | `RoundKit.service({Phases, Replicas?, TickSeconds?=1})` | Phase: `{Name, Duration?, MinPlayers?}`; service `:advance()`, `:current()`; Bus `Round.PhaseChanged` |
 | `Projectiles.attach(kernel, {Rewind?, TickRate?=30}?)` · `:define(id, {Speed, Gravity?, MaxLifetime?=3, Hitbox?, OnHit?, OnExpire?})` · `:fire(session, id, origin, dir, timestamp?) → (ok, reason?)` | Server sim; Bus `Projectile.Hit`. Set `Hitbox = {Radius?, HalfHeight?}` to resolve player hits via capsule hitboxes (same shape/knobs as WeaponKit, honors the Rewind's `ShowHitboxes` display); without it, hits stay raw raycasts against character geometry and `OnHit` gets the engine RaycastResult |
-| `ProjectileClient.new({[id] = {Gravity?, Create, OnImpact?}})` | Pooled client visuals, same math as the server |
+| `ProjectileClient.new({[id] = {Gravity?, Create, OnImpact?}}, {MaxVisuals?}?)` | Pooled client visuals, same math as the server; `MaxVisuals` render cap defaults from the device profile (hits still land) |
 | `Effects.attach(kernel)` · `:define(name, {Duration?, MaxStacks?=1, Stats? = {[stat]=multiplier}, OnApply?, OnExpire?})` · `:apply(session, name, {Duration?}?) → stacks` · `:remove` · `:has` · `:stacks` · `:statMultiplier(session, stat) → number` | Humanoid stats auto-applied; Bus `Effects.Applied/Expired` |
 | `Prediction.wrap(net, name, schema, {Predict?, TimeoutSeconds?=2}) → {fire → seq, OnResolved}` | Pairs with `Net:definePredictedIntent(name, schema, opts)` |
 | `Zones.attach(kernel, {IntervalSeconds?=0.25}?)` · `:add(name, part or {parts}, {OnEnter?, OnLeave?}?) → handle` · `:addPart(name, part)` · `:remove(name)` · `:addTagged(tag, {NameAttribute?="ZoneName"}?) → stop` · `:track(entity) → untrack` · `:trackTag(tag) → stop` · `:untrack(entity)` · `:playersIn(name)` · `:entitiesIn(name)` · `:isInside(name, occupant)` | Handle carries `Entered`/`Left` Signals firing `(occupant)`; Bus `Zone.Entered/Left` `(name, player)` for players, `Zone.EntityEntered/EntityLeft` `(name, entity)` for tracked entities (leaves before enters). `addTagged` builds zones from CollectionService tags — same-named parts union into one multi-part zone |
@@ -2094,11 +2128,12 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `Pathfinding.attach(kernel?)` · `:find({Method?="Direct", Start, Goal, Grid?, MaxExpansions?, Exclude?, AgentParams?}) → (ok, waypointsOrReason)` · `:distanceField({Grid, Origin, MaxDistance?}) → {[cellKey] = studs}?` · `Pathfinding.follower({Paths, Grid, Method?="ThetaStar", RepathDistance?, ArriveDistance?, Clock?}) → follower` · `follower:step(position, goal) → (nextPoint, {Path?, Jump, Stuck})` · `follower:reset()` · `Pathfinding.grid({Origin, Width, Height, CellSize?=4, AgentHeight?=6, MaxStepHeight?=4, IsWalkable?}) → grid` · `grid:refresh()` · `grid:refreshRegion(minWorld, maxWorld)` · `grid:addLink(fromWorld, toWorld, cost?)` · `grid:groundY(x, z)` · `grid:nearestWalkable(position, maxCells?=8) → Vector3?` · `grid:lineOfSight(x0, z0, x1, z1)` (feet) · `grid:sightLine(x0, z0, x1, z1)` (eyes) | Methods `AStar`/`ThetaStar`/`Direct`/`Roblox`, lazily required; failures return reasons (`GoalBlocked`, `NoPath`, `BudgetExhausted`, ...); `Roblox` yields (the follower runs it off-thread). Default rasterizer raycasts ground (Terrain + CanCollide parts), waypoints ride elevation, `MaxStepHeight` refuses cliffs per step AND along straight lines; walkable high ground occludes sight, valleys only block feet. `refresh` bumps `grid.Version` so followers re-path |
 | `Settings.attach(kernel, {Schema, Field?="Settings", RateLimit?=10})` · `:get(session, key)` · `:all(session)` · `:set(session, key, value)` · rule: `{Kind = "number"/"boolean"/"string"/"strings", Default, Min?, Max?, MaxLength?=64, MaxItems?=8}` | Allowlisted client writes: clamp/cap/rebuild through `Intent.Settings_Set`; persists via profile; Bus `Settings.Changed`. Client: `SettingsClient.new(net)` · `:fetch()` · `:get` · `:set` · `:onChanged(fn)` |
 | `Analytics.attach(kernel, {FlushSeconds?=10, MaxPerMinute?=120, Sample?, Destination?, WatchErrors?, Seed?}?)` · `:track(name, player?, value?, fields?) → bool` · `:stats via .Stats` · `:destroy()` (flushes) | Batched to `AnalyticsService:LogCustomEvent` or an injected destination; sampled/over-cap drops counted, never silent |
-| `BonePhysics.attach({Gravity?, Wind?, FixedHz?=60, MaxSubsteps?=3, MaxDistance?=100, ShouldSimulate?}?)` · `:bind(part, {Damping?=0.92, Stiffness?=0.1, GravityScale?, WindScale?}?) → handle?` · `:bindParts({parts}, settings?)` · `:bindCharacter(model, settings?) → {handles}` · `:step(dt)` · `handle:destroy()` · `:destroy()` | Client-side verlet bone chains (shared module, `ReplicatedStorage.ChloeKernel.BonePhysics`); fixed timestep, culling with pose snap-back, teleport guard, Transform-slot writes, Destroying auto-unbind |
+| `BonePhysics.attach({Gravity?, Wind?, FixedHz?=60, MaxSubsteps?=3, MaxDistance?=100, MaxChains?=20, ShouldSimulate?}?)` · `:bind(part, {Damping?=0.92, Stiffness?=0.1, GravityScale?, WindScale?}?) → handle?` · `:bindParts({parts}, settings?)` · `:bindCharacter(model, settings?) → {handles}` · `:step(dt)` · `handle:destroy()` · `:destroy()` | Client-side verlet bone chains (shared module, `ReplicatedStorage.ChloeKernel.BonePhysics`); fixed timestep, culling with pose snap-back, chain budget (past `MaxChains` the nearest to camera win), teleport guard, Transform-slot writes, Destroying auto-unbind; unconfigured `MaxDistance`/`MaxChains` default from the device profile on clients |
 | `Ragdoll.attach(kernel, {MaxActive?=16, AutoDeath?, CollisionGroup?, FrictionTorque?=60}?)` · `:enable(model, {Duration?, Impulse?}?) → bool` · `:release(model)` · `:isRagdolled(model)` · `:destroy()` — clients: `RagdollClient.listen(netClient)` | Build-once/toggle: Motor6D→limited BallSocket swap or AnimationConstraint cut with native-socket friction/limit tuning, NoCollision limb pairs, full restore; owner-client `CKRagdoll` push flips humanoid state, silences Animate, applies impulses, uprights on release; Bus `Ragdoll.Started/Ended` |
 | `AudioKit.attach(kernel, {Buses?, MaxChannels?=32, Parent?, Npcs?, Occlusion = {GetListener?, IsBlocked?, Pathfinding?, Grid?}?}?)` · `:register/registerBank` · `:play(name, opts?) → handle` · `:playAt(name, target, opts?)` · `:playMusic` · `:playLayers → {setWeights, resync, stop}` · `:speak` · `:duck(bus, scale) → release` · `:setBusVolume` · `:bindSettings(prefs, map)` · `:reverbZone(part, type)` · `:soundscape` · `:assetIds()` · `:destroy()`; `AudioKit.server(kernel) → {broadcast, playFor, broadcastAt}` · `audio:listen(netClient)` | Bank config: `{Id, Bus?, Volume?, Speed?, Looped?, Priority?, Pooled?, RollOff*, Cues?, Subtitle?, Duck?}`; handle: `stop(fade?)/setVolume/setSpeed`. Bus events `Audio.Cue/Subtitle/SubtitleEnded` |
 | `AnimKit.attach(kernel, {LoadTrack?}?)` · `:register/registerBank` (`{Id, Priority?, Speed?, FadeIn?, Looped?, Group?, Markers?}`) · `:attachRig(model) → rig` · `:assetIds()` · `:destroy()`; rig: `:play(name, {Fade?, Speed?, Weight?})` · `:stop/stopAll/setSpeed` · `:ik(name, {Type = "LookAt"/"Reach"/"Transform"/"Rotation", Target, ChainRoot?, EndEffector?, Weight?, FadeIn?, Properties?}) → {Control, setWeight, setTarget, release}` · `:destroy()` | Exclusive `Group`s crossfade; markers publish `Anim.Marker`; IK weights blend on the kit stepper; rigs die with their model |
 | `Preload.run(kernel, {Assets?, Banks?, BatchSize?=16}?) → {Done, Loaded, Total, Failed, await()}` | Batched `PreloadAsync`; Bus `Preload.Started/Progress/Done`; failures collect, never abort |
+| `DeviceBench.run({BudgetMs?=90, Frames?=0, Force?, Clock?, Bus?}?) → {Score, Quality, Axes{Compute, Churn, Resume}, Tier, ComputePerSecond, ChurnPerSecond, ResumePerSecond, Platform, FrameMs?}` · `.profile(resultOrQualityOrTier?) → Profile` · `.quality(result?) → number` · `.axes(measures) → Axes` · `.scale(min, max, result?)` · `.pick(byTier, result?)` · `.tier(result?)` · `.score(measures) → (score, tier)` · `.governor({TargetFps?=60, Result?, Manual?, Clock?, Bus?, OnChange?}?) → {Quality, Tier, sample(dt), profile(), stop()}` | Time-boxed device benchmark (compute + churn + resumes); Quality and each axis are continuous 0.25..4 multipliers vs a mid-range reference (decimals allowed; tiers Low/Medium/High/Ultra remain coarse conveniences); Profile budgets `{ViewDistance, VfxDensity, ParticleBudget, ShadowsEnabled, PostFx, BoneChains, BoneDistance, AudioChannels, ProjectileVisuals}` are funded by the axis that pays each cost (Churn → particles/vfx, Compute → bones/projectile visuals, Resume → channels) and consumed by unconfigured BonePhysics `MaxDistance`/`MaxChains`, AudioKit `MaxChannels`, ProjectileClient `MaxVisuals`; `scale` is log2-mapped (each quality doubling buys the same slice); governor holds TargetFps by nudging effective quality ×0.8 after ~3s of p95 misses / ×1.15 after ~10s of headroom, capped at the benched quality, axis ratios preserved (Bus `Device.QualityChanged(quality, profile)`). Client measurement — cosmetics, never authority |
 
 ### TestKit / Bench
 
