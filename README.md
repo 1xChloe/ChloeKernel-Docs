@@ -30,6 +30,7 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Run a round-based match loop](#run-a-round-based-match-loop) | [Log with scopes and sinks](#log-with-scopes-and-sinks) |
 | [Fire projectiles with travel time](#fire-projectiles-with-travel-time) | [Capture and deduplicate script errors](#capture-and-deduplicate-script-errors) |
 | [Make abilities feel instant](#make-abilities-feel-instant) | [Tune values live without redeploying](#tune-values-live-without-redeploying) |
+| [Bind abilities to movement, not just keys](#bind-abilities-to-movement-not-just-keys) | |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -819,6 +820,45 @@ Dash.fire()
 ```
 
 Predict only local/cosmetic state. No ack within the timeout (dropped packet, rate-limited spam) also rolls back.
+
+### Bind abilities to movement, not just keys
+
+MoveKit answers "jump pressed WHILE AIRBORNE" instead of just "jump pressed" — the double-jump/air-step/dash family, with charges that refill on landing:
+
+```lua
+-- Client
+local Moves = MoveKit.new(Kernel, { Net = Net })
+Moves:define("DoubleJump", MoveKit.recipes.doubleJump({ Power = 1.2 }))
+Moves:define("AirStep", MoveKit.recipes.airStep({
+	Steps = 3, -- anime stair-running: three footholds per fall
+	OnStep = function(position, useIndex) spawnGlowPad(position) end,
+}))
+Moves:define("AirDash", {
+	Input = "Dash", -- an InputDriver action; "Jump" rides the jump request itself
+	When = "Airborne", -- or "Grounded"/"Rising"/"Falling"/function(context)
+	Charges = 1, Cooldown = 1.5,
+	Run = function(context)
+		context.Root.AssemblyLinearVelocity = context.Root.CFrame.LookVector * 90
+	end,
+})
+```
+
+```lua
+-- Server: the meter. Unknown abilities reject, spent charges reject, and the
+-- pool refills only when the SERVER's own ground probe sees feet touch down.
+MoveKit.server(Kernel, {
+	Abilities = {
+		DoubleJump = { Charges = 1, Cooldown = 0.2 },
+		AirStep = { Charges = 3, Cooldown = 0.15 },
+		AirDash = { Charges = 1, Cooldown = 1.5, Forgive = true }, -- horizontal burst: pardon the anti-cheat sample
+	},
+})
+Kernel.Bus:subscribe("Move.Used", function(_, session, name, position)
+	-- replicate the VFX to everyone else here
+end)
+```
+
+The ownership guarantee holds: the client executes (it owns its character's physics — the velocity writes are legitimate), the server meters through the fail-closed `CKMove` intent with its own charge/cooldown books. A hacked client can spam requests; it cannot make the server bless a fourth air-step. `Run` receives `{Humanoid, Root, State, AirTime, Rising, UseIndex, ChargesLeft}` — `UseIndex` is how the second air-step gets a different sound than the first. Triggers debounce the takeoff press (`MinAirTime`, default 0.1s), and `kit:trigger(name)` fires abilities from your own code. Client bus: `Move.Triggered(name, context)`; server bus: `Move.Used(session, name, position)` / `Move.Rejected(player, name, reason)`.
 
 ### Apply buffs and debuffs
 
@@ -1931,6 +1971,8 @@ end)
 ### InputDriver (client)
 
 `InputDriver.new(kernel)` · `:bindAction(name, {Keyboard?, Gamepad?, TouchButton?, Handler?})` · `:rebind(name, "Keyboard"|"Gamepad", keys?)` · `:unbindAction(name)` · `:getBindings()` · `:destroy()`. Emits `Input.<Action>` on the bus. `Keyboard`/`Gamepad` take one `Enum.KeyCode` or an array of them; snapshots mirror the shape (name or array of names).
+
+`MoveKit.new(kernel, {Net?, Clock?, Humanoid?, Root?, SkipCharacterTracking?}?)` — `:define(name, {Input?, When?="Airborne", Charges?=1, Cooldown?=0, MinAirTime?=0.1, Announce?=true, Run})` · `:trigger(name) → bool` · `:destroy()` · `MoveKit.jumpVelocity(humanoid)` · recipes `MoveKit.recipes.{doubleJump({Power?, Charges?, Cooldown?}?), airStep({Steps?=3, Boost?=0.75, Cooldown?, OnStep?}?)}`. Server: `MoveKit.server(kernel, {Abilities = {[name] = {Charges?, Cooldown?, Forgive?}}, IsGrounded?, Clock?, CooldownSlack?=0.05})` — fail-closed `CKMove` intent metering with server-side ground truth; `Input = "Jump"` rides `UserInputService.JumpRequest`, other strings ride `Input.<Action>` bus events. Bus: client `Move.Triggered(name, context)`, server `Move.Used(session, name, position)` / `Move.Rejected(player, name, reason)`.
 
 ### DataDriver
 
