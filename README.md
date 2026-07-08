@@ -30,7 +30,7 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Run a round-based match loop](#run-a-round-based-match-loop) | [Log with scopes and sinks](#log-with-scopes-and-sinks) |
 | [Fire projectiles with travel time](#fire-projectiles-with-travel-time) | [Capture and deduplicate script errors](#capture-and-deduplicate-script-errors) |
 | [Make abilities feel instant](#make-abilities-feel-instant) | [Tune values live without redeploying](#tune-values-live-without-redeploying) |
-| [Bind abilities to movement, not just keys](#bind-abilities-to-movement-not-just-keys) | |
+| [Bind abilities to movement, not just keys](#bind-abilities-to-movement-not-just-keys) | [Fight hand to hand, parries included](#fight-hand-to-hand-parries-included) |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -859,6 +859,29 @@ end)
 ```
 
 The ownership guarantee holds: the client executes (it owns its character's physics — the velocity writes are legitimate), the server meters through the fail-closed `CKMove` intent with its own charge/cooldown books. A hacked client can spam requests; it cannot make the server bless a fourth air-step. `Run` receives `{Humanoid, Root, State, AirTime, Rising, UseIndex, ChargesLeft}` — `UseIndex` is how the second air-step gets a different sound than the first. Triggers debounce the takeoff press (`MinAirTime`, default 0.1s), and `kit:trigger(name)` fires abilities from your own code. Client bus: `Move.Triggered(name, context)`; server bus: `Move.Used(session, name, position)` / `Move.Rejected(player, name, reason)`.
+
+### Fight hand to hand, parries included
+
+MeleeKit is the timing game, server-authoritative: windup, hit frame, recovery — with combos that cancel recovery, blocks that chip, guard-breaks that shatter blocks, and timed parries that beat everything:
+
+```lua
+local Melee = MeleeKit.attach(Kernel, {
+	Moveset = {
+		Jab = { Damage = 8, Range = 7, Arc = 120, Windup = 0.15, Recovery = 0.25, ComboNext = { "Cross" } },
+		Cross = { Damage = 12, Windup = 0.2, Recovery = 0.3, ComboNext = { "Uppercut" } },
+		Uppercut = { Damage = 20, Windup = 0.3, Recovery = 0.5 },
+		Haymaker = { Damage = 25, Windup = 0.6, Recovery = 0.5, GuardBreak = true },
+	},
+	ParryWindow = 0.18, StaggerSeconds = 1.1,
+})
+Kernel.Bus:subscribe("Melee.Parried", function(_, victim, attacker, attackName)
+	-- clang VFX + the attacker is Staggered: the punish window is open
+end)
+```
+
+**The triangle**: parry beats attack (the attacker staggers — a free punish window), block beats attack (damage scales to chip), guard-break beats block (full damage, the guard drops) but loses to parry HARDER (`GuardBreakStaggerScale`, default 1.5x stagger). Every timing runs on the server clock, and parry windows carry `LatencySlack` so honest defenders get their frames back — spam still can't cover a swing because attempts consume `ParryCooldown` whether they connect or not.
+
+Players ride three fail-closed intents (`ML_Attack`/`ML_Block`/`ML_Parry`, auto-wired per session): "attack while staggered" dies in validation, never in a handler. Combos are declared on the moveset (`ComboNext` cancels recovery along the chain only; `Melee.Combo(attacker, chain)` counts the string). And it's UNIFIED with NPCs the same way everything else is: register an npc handle and its behaviors call `Melee:attack(npc, "Jab")`, while npc VICTIMS with no manual parry automatically roll their own skill-scaled `npc:defend()` — a Perfect duelist reads your haymaker like a book, a Bad one eats it. Hook point `Melee.CanHit` (fail-open) vetoes friendly fire. Bus: `Melee.Hit/Blocked/GuardBroken/Parried/Staggered/Combo/State`.
 
 ### Apply buffs and debuffs
 
@@ -2100,6 +2123,8 @@ local Ok, Chunk = Pool:dispatch(chunkX, chunkZ) -- yields until the worker repli
 ```
 
 ### Kits
+
+`MeleeKit.attach(kernel, {Moveset, BlockScale?=0.25, ParryWindow?=0.18, ParryCooldown?=0.6, StaggerSeconds?=1.1, GuardBreakStaggerScale?=1.5, LatencySlack?=0.075, TickSeconds?=0.05, Intents?=true, Clock?, GetPosition?, GetFacing?, SkipLoop?})` — `:register(entity, {Humanoid?}?)` · `:unregister(entity)` · `:attack(entity, name) → bool` · `:block(entity, down) → bool` · `:parry(entity) → bool` · `:canAttack(entity, name)` · `:state(entity)` · `:destroy()`. Attacks: `{Damage, Range?=7, Arc?=120, Windup?=0.2, Recovery?=0.3, ComboNext?, GuardBreak?, OnHit?}`. Player intents `ML_Attack`/`ML_Block`/`ML_Parry` auto-wire fail-closed; npc victims with `.defend` roll their skill-scaled reaction as the parry. Hook `Melee.CanHit` (fail-open); Bus `Melee.Hit/Blocked/GuardBroken/Parried/Staggered/Combo/State`.
 
 `WeaponKit.service({Weapons, Rewind?, Ammo?})` · `SpellKit.service({Spells, MaxMana?=100, ManaRegenPerSecond?=5})` · `CheckpointKit.service({FolderName?="Checkpoints", MinimumLegitSeconds?=3, StageField?="BestStage"}?)` · `ProceduralKit.service({Archetypes, RegenSecondsPerModel?=0.25})` — each returns a service definition for `kernel:registerService`. ProceduralKit: `spawn(name, {CFrame?, Size?, Params?, Parent?, Owner?}) -> handle` (`handle:set/patch/resize/regenerate/waitForGeneration/destroy`), `validate(name, params) -> (ok, cleanedOrReason)` for wiring client customization intents.
 
