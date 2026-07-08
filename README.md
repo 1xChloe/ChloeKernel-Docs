@@ -35,6 +35,7 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Keep global top-100 boards](#keep-global-top-100-boards) | [Roll loot with pity timers](#roll-loot-with-pity-timers) |
 | [Craft items at stations](#craft-items-at-stations) | [Sell things for coins](#sell-things-for-coins) |
 | [Summon familiars and pets](#summon-familiars-and-pets) | [Fuzz every channel with hostile payloads](#fuzz-every-channel-with-hostile-payloads) |
+| [Group players into parties](#group-players-into-parties) | |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -75,6 +76,10 @@ Boot scripts are pre-wired: pressing Play runs the spec suites and boots both ke
 ### Starter templates
 
 [templates/](templates/) holds three complete minimal games as reference code — a team gun arena (WeaponKit, lag compensation, TeamKit, rounds, global boards), a wizard duel (SpellKit, MeleeKit parries, MoveKit double jumps, curse/ward Effects), and a checkpoint obby (CheckpointKit, air steps, kill-brick zones, speedrun boards). Each is one server module and one client module; copy the bodies into your Bootstraps. Map requirements sit at the top of each server file.
+
+### Releases
+
+Tagged versions ship a built `.rbxm` on the [GitHub Releases page](https://github.com/1xChloe/ChloeKernel/releases) — insert it into a place to pin an exact framework version instead of syncing `main`. Or build locally: `rojo build build.project.json -o ChloeKernel.rbxm`. Pushing a `v*` tag builds the artifact and cuts the release from the matching CHANGELOG section automatically.
 
 ## Core concepts
 
@@ -880,6 +885,17 @@ local Teams = TeamKit.attach(Kernel, {
 ```
 
 New sessions auto-balance onto the emptiest team (capacity-weighted, so a 2-cap duelist corner fills proportionally against 8-cap armies); `assign`/`teamOf`/`players`/`sameTeam` cover manual control. **Friendly fire is off by default** and enforced where damage actually happens: the kit registers vetoes on `Weapon.CanDamage` and `Melee.CanHit`, and npc handles resolve through their `Faction` — Raiders-faction NPCs and Raiders-team players read as teammates with zero extra wiring. Spawn ownership is map-authored: tag parts `TeamSpawn` with a `Team` attribute and characters pivot to an owned spawn (anti-exploit pardoned). Bus: `Team.Assigned(player, team, previous?)`.
+
+### Group players into parties
+
+PartyKit is same-server parties: invites with expiry, one party per player, leader flow, and roster pushes so party UI is a render problem:
+
+```lua
+local Parties = PartyKit.attach(Kernel, { MaxSize = 4, InviteTtlSeconds = 60 })
+Kernel.Bus:subscribe("Party.Joined", function(_, party, player) ... end)
+```
+
+Inviting while partyless creates the party on the first accept with the inviter as leader. Accepting leaves the current party. Leaders kick and promote; a leaving leader promotes the longest-standing member; the last member out disbands. Session end leaves the party and clears the player's invites in both directions. Clients drive everything through six fail-closed intents (`PT_Invite/Accept/Decline/Leave/Kick/Promote`, UserIds on the wire) and receive `PT_Sync` roster pushes plus `PT_Invited` notifications. Parties are NOT teams — they never touch the combat gates; `sameParty(a, b)` exists for games that want party friendly-fire, and `members(player)` feeds Matchmaking group queues (a partyless player is a party of one). Gate invites in the `Party.CanInvite` hook (blocklists, level requirements). Bus: `Party.Created/Disbanded/Joined/Left/Kicked/Invited/Promoted`.
 
 ### Fire projectiles with travel time
 
@@ -2301,6 +2317,8 @@ local Ok, Chunk = Pool:dispatch(chunkX, chunkZ) -- yields until the worker repli
 `ShopKit.attach(kernel, {Shops, Inventory, Currency?, CurrencyField?="Coins", Clock?, Intents?=true})` — `:buy(session, shop, item, count?) → (ok, reason?)` · `:sell(...)` · `:listings(shop)`. Shops: `{Listings? = {[id] = {Price?, SellPrice?, Stock?}}, Rotation? = {Every, Size, Pool, Seed?, Listing?}}`; rotation is deterministic per window across servers; Currency adapter `{Get, Take, Give}`; intents `SH_Buy`/`SH_Sell` (count <= 99); Bus `Shop.Bought/Sold/Rejected`.
 
 `CompanionKit.attach(kernel, {Npcs, Effects?, Companions, TickSeconds?=0.25, Intents?=true, SkipLoop?})` — `:summon(session, id) → npc?` · `:dismiss(session)` · `:companionOf(session) → (npc?, id?)` · `:destroy()`. Companions: `{Archetype, FollowDistance?=8, TeleportDistance?=60, Aura?, OnSummon?, OnDismiss?}`; one per session; intents `CP_Summon`/`CP_Dismiss`; hook `Companion.CanSummon` (fail-open); Bus `Companion.Summoned/Dismissed/Died`.
+
+`PartyKit.attach(kernel, {MaxSize?=4, InviteTtlSeconds?=60, TickSeconds?=5, Clock?, Intents?=true, SkipLoop?}?)` — `:invite(from, target) → (ok, reason?)` · `:accept(player, from) → (ok, reason?)` · `:decline(player, from)` · `:leave(player)` · `:kick(leader, member)` · `:promote(leader, member)` · `:partyOf(player) → party?` · `:sameParty(a, b)` · `:members(player) → {Player}` · `:destroy()`. Intents `PT_Invite/Accept/Decline/Leave/Kick/Promote` (fail-closed, UserIds as F64); state pushes `PT_Sync` (roster) and `PT_Invited`; hook `Party.CanInvite` (fail-open); Bus `Party.Created/Disbanded/Joined/Left/Kicked/Invited/Promoted`.
 
 `TeamKit.attach(kernel, {Teams = {[name] = {Color?, Capacity?}}, AutoAssign?=true, FriendlyFire?=false, SpawnTag?="TeamSpawn", UseSpawns?, SyncRoblox?, Seed?})` — `:assign(player, team) → bool` · `:teamOf(subject) → name?` (Player/session/character/npc handle via Faction) · `:sameTeam(a, b)` · `:players(team)` · `:emptiest()` · `:destroy()`. Vetoes `Weapon.CanDamage` + `Melee.CanHit` unless FriendlyFire; tagged `TeamSpawn` parts with a `Team` attribute own spawns; Bus `Team.Assigned(player, team, previous?)`.
 
