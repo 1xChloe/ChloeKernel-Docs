@@ -32,7 +32,9 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Make abilities feel instant](#make-abilities-feel-instant) | [Tune values live without redeploying](#tune-values-live-without-redeploying) |
 | [Bind abilities to movement, not just keys](#bind-abilities-to-movement-not-just-keys) | [Fight hand to hand, parries included](#fight-hand-to-hand-parries-included) |
 | [Give players an inventory](#give-players-an-inventory) | [Split players into teams](#split-players-into-teams) |
-| [Keep global top-100 boards](#keep-global-top-100-boards) | |
+| [Keep global top-100 boards](#keep-global-top-100-boards) | [Roll loot with pity timers](#roll-loot-with-pity-timers) |
+| [Craft items at stations](#craft-items-at-stations) | [Sell things for coins](#sell-things-for-coins) |
+| [Summon familiars and pets](#summon-familiars-and-pets) | [Fuzz every channel with hostile payloads](#fuzz-every-channel-with-hostile-payloads) |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -430,6 +432,78 @@ Inventory:take(session, "Potion", 1) -- crafting costs, trade escrow (all-or-not
 ```
 
 Grants and takes are **server-API-only** — no client message can mint an item. Clients get four fail-closed intents (`INV_Move`/`INV_Equip`/`INV_Unequip`/`INV_Use`) whose validators re-derive legality from the server's books, and the owner receives an `INV_Sync` state push after every mutation — inventory UI is purely a render problem. Stacking tops up piles before opening slots, `move` is the drag-and-drop primitive (swap or merge, equip references follow), equipping displaces the incumbent through its `OnUnequip`, and draining a stack auto-unequips. Hook points `Inventory.CanEquip`/`Inventory.CanUse` (fail-open) carry game rules like tournament locks. `Persist = false` keeps a bag session-only (battle-royale loadouts). Bus: `Inventory.Granted/Taken/Equipped/Unequipped/Used/Changed`.
+
+### Roll loot with pity timers
+
+LootKit rolls weighted tables server-side. Entries yield items, nested tables, or nothing; `PityAfter = N` force-hits an entry on the Nth consecutive miss, with counters persisted per player in the profile:
+
+```lua
+local Loot = LootKit.attach(Kernel, {
+	Inventory = Inventory,
+	Tables = {
+		Chest = { Rolls = 2, Entries = {
+			{ Weight = 70, Id = "Coin", Count = { 5, 20 } },
+			{ Weight = 25, Table = "Herbs" }, -- nested table rolled in place
+			{ Weight = 5, Id = "RareRelic", PityAfter = 30 }, -- guaranteed within 31 opens
+		} },
+		Herbs = { Entries = { { Weight = 1, Id = "Sage" }, { Weight = 1, Id = "Nightshade" } } },
+	},
+})
+local Granted, Overflow = Loot:award(session, "Chest") -- rolls + grants through InventoryKit
+```
+
+`roll(name)` rolls with no player (display, previews) and never advances pity. `rollFor(session, name)` rolls against the player's persisted counters. Nesting caps at depth 8 and unknown table references fail at attach. Bus: `Loot.Rolled(tableName, items, session?)`, `Loot.Awarded(session, tableName, granted, overflow)`.
+
+### Craft items at stations
+
+CraftingKit is recipes over InventoryKit — inputs check atomically before any take, timed crafts queue with cancel refunds, and station recipes gate on where the player crafts:
+
+```lua
+local Crafting = CraftingKit.attach(Kernel, {
+	Inventory = Inventory,
+	Recipes = {
+		HealthPotion = { Inputs = { Herb = 2, Water = 1 }, Output = { Potion = 1 }, Seconds = 3 },
+		IronSword = { Inputs = { Iron = 3 }, Output = { Sword = 1 }, Station = "Forge" },
+	},
+})
+```
+
+Clients ride `CR_Craft {recipeId, station}` and `CR_Cancel` through the fail-closed chain; the claimed station verifies in the `Craft.CanCraft` hook (check proximity to the tagged forge there — InteractionKit's zone or a distance check). One active craft per session; `canCraft` returns reasons (`MissingInputs`, `Busy`, `WrongStation`, `Vetoed`). Output that cannot fit publishes `Craft.Overflow`. Bus: `Craft.Started/Completed/Cancelled/Overflow`.
+
+### Sell things for coins
+
+ShopKit is soft-currency shops over InventoryKit (Commerce owns Robux; this owns coins). The default currency adapter reads and writes a profile field; custom adapters plug in for anything else:
+
+```lua
+local Shop = ShopKit.attach(Kernel, {
+	Inventory = Inventory,
+	CurrencyField = "Coins",
+	Shops = {
+		Apothecary = {
+			Listings = { Herb = { Price = 5, SellPrice = 2 }, Cauldron = { Price = 250 } },
+			Rotation = { Every = 3600, Size = 3, Pool = { "RareSeed", "Moonstone", "Vial", "Charm" }, Seed = 7 },
+		},
+	},
+})
+```
+
+Rotation picks derive from `Seed + floor(clock / Every)` — every server lists the same rotating stock with zero coordination. `Stock = N` caps buys per player per window. Buys grant first and charge for what fit (a partial grant charges the partial price; a full inventory charges nothing). Clients ride `SH_Buy`/`SH_Sell` fail-closed with counts capped at 99. Bus: `Shop.Bought/Sold/Rejected`.
+
+### Summon familiars and pets
+
+CompanionKit gives sessions an owned NPC follower built from NPCKit archetypes — the witchcraft familiar, the lobby pet:
+
+```lua
+local Companions = CompanionKit.attach(Kernel, {
+	Npcs = Npcs, Effects = Buffs,
+	Companions = {
+		BlackCat = { Archetype = "Cat", FollowDistance = 8, TeleportDistance = 60, Aura = "CatLuck" },
+	},
+})
+Companions:summon(session, "BlackCat") -- or wire it to an InventoryKit item's OnUse
+```
+
+One companion per session (a new summon replaces the old). The follow loop walks the companion at `FollowDistance`, pivots it beside the owner past `TeleportDistance`, and a dead companion clears with `Companion.Died`. `Aura` holds an Effects buff on the OWNER while summoned and removes it on dismiss or death. Gate ownership in the `Companion.CanSummon` hook. Clients ride `CP_Summon`/`CP_Dismiss` fail-closed. Bus: `Companion.Summoned/Dismissed/Died`.
 
 ### Run code when a player joins or leaves
 
@@ -941,6 +1015,15 @@ if Buffs:has(session, "Chill") then ... end
 
 WalkSpeed recomputes from the humanoid's base across all active effects, so overlapping buffs and removals always land on the right value — and the movement anti-exploit reads live WalkSpeed, so hasted players are never false-flagged.
 
+Effects is a full status system. `TickSeconds` + `OnTick` fire periodic ticks (poison damage, regen heals) with bounded catch-up after a stall. `Category = "Curse"` makes an effect dispellable: `Buffs:cleanse(session, "Curse")` removes every matching effect, `cleanse(session)` removes every categorized one, and uncategorized effects (VIP flags) never cleanse. `Immune = { "Curse" }` on an effect blocks applies of the covered categories while it holds — wards are effects, so an anti-curse ward is one `define` with a duration. Owners receive a `CKEffects` state push after every change (`{ [name] = { Stacks, Remaining? } }`) for status-icon UI. Bus adds: `Effects.Blocked(player, name, byEffect)`, `Effects.Cleansed(player, category?, count)`.
+
+```lua
+Buffs:define("Poison", { Duration = 6, Category = "Toxin", TickSeconds = 1,
+	OnTick = function(session) damage(session, 2) end })
+Buffs:define("Ward", { Duration = 30, Immune = { "Curse", "Toxin" } })
+Buffs:cleanse(session, "Toxin") -- the antidote
+```
+
 ### React to players and NPCs entering areas
 
 ```lua
@@ -1324,6 +1407,17 @@ assert(#Findings == 0, "ship blocked: security audit found issues")
 ```
 
 One post-boot sweep over every assumption the security model makes: handler-bearing channels with no validator, `Open = true` escape hatches (by design, but confirm each survives hostile input), gate hook points flipped `FailOpen` (a crashing validator would PASS payloads), and channels still on the default rate limit. Sorted most severe first; `auditValidators()` remains the narrow unguarded-only sweep.
+
+### Fuzz every channel with hostile payloads
+
+The audit reads configuration; the fuzzer exercises handling. `Fuzz.run` builds hostile argument sets per schema type (empty and 10KB strings, format specifiers, control bytes, 0, -1, type maxima, NaN, infinities, NaN vector components, nil and nested tables for Any) and drives each registered intent and request through the real pipeline — hook chain first, handler on pass:
+
+```lua
+local Report = Fuzz.run(Kernel, { Session = session, CasesPerChannel = 64 })
+assert(#Report.HandlerErrors == 0) -- a boot-time sanity gate
+```
+
+A payload that passes validation and then crashes the handler is a bug in one of the two — every such case lands in `Report.HandlerErrors` with the channel, arguments, and error. Validators that throw count as rejects (fail-closed holds under fuzzing) and surface as kernel warnings. Deterministic per `Seed`; filter with `Channels`; pass a real session for accurate results. The wire's typed serialization bounds what real clients can send — the fuzzer sends past those bounds on purpose.
 
 ### Show stats on the leaderboard
 
@@ -2183,6 +2277,14 @@ local Ok, Chunk = Pool:dispatch(chunkX, chunkZ) -- yields until the worker repli
 
 `InventoryKit.attach(kernel, {Items, MaxSlots?=30, Persist?=true, Field?="Inventory"})` — `:grant(session, id, count?) → granted` · `:take(session, id, count?) → bool` (all-or-nothing) · `:count(session, id)` · `:move(session, from, to)` · `:equip(session, slotIndex)` · `:unequip(session, slotName)` · `:equipped(session, slotName) → (item?, index?)` · `:use(session, slotIndex)` · `:items(session)`. Items: `{Name?, Stack?=1, Kind?, Equip?, OnUse?, OnEquip?, OnUnequip?, Meta?}`. Client intents `INV_Move/Equip/Unequip/Use` fail-closed; owner state push `INV_Sync`; hooks `Inventory.CanEquip/CanUse` (fail-open); Bus `Inventory.Granted/Taken/Equipped/Unequipped/Used/Changed`.
 
+`LootKit.attach(kernel, {Tables, Inventory?, Seed?, Rng?})` — `:roll(table) → items` · `:rollFor(session, table) → items` (pity persists in profile `Data.LootPity`) · `:award(session, table) → (granted, overflow)`. Entries: `{Weight, Id?, Count?|{min,max}, Table?, Nothing?, PityAfter?}`; tables: `{Rolls?|{min,max}, Entries}`; nesting caps at 8; unknown references fail at attach. Bus `Loot.Rolled/Awarded`.
+
+`CraftingKit.attach(kernel, {Recipes, Inventory, TickSeconds?=0.25, Clock?, Intents?=true, SkipLoop?})` — `:craft(session, recipeId, station?) → (ok, reason?)` · `:canCraft(...)` · `:cancel(session)` (refunds) · `:activeCraft(session)` · `:destroy()`. Recipes: `{Inputs, Output, Seconds?=0, Station?, OnComplete?}`; intents `CR_Craft`/`CR_Cancel`; hook `Craft.CanCraft` (fail-open); Bus `Craft.Started/Completed/Cancelled/Overflow`.
+
+`ShopKit.attach(kernel, {Shops, Inventory, Currency?, CurrencyField?="Coins", Clock?, Intents?=true})` — `:buy(session, shop, item, count?) → (ok, reason?)` · `:sell(...)` · `:listings(shop)`. Shops: `{Listings? = {[id] = {Price?, SellPrice?, Stock?}}, Rotation? = {Every, Size, Pool, Seed?, Listing?}}`; rotation is deterministic per window across servers; Currency adapter `{Get, Take, Give}`; intents `SH_Buy`/`SH_Sell` (count <= 99); Bus `Shop.Bought/Sold/Rejected`.
+
+`CompanionKit.attach(kernel, {Npcs, Effects?, Companions, TickSeconds?=0.25, Intents?=true, SkipLoop?})` — `:summon(session, id) → npc?` · `:dismiss(session)` · `:companionOf(session) → (npc?, id?)` · `:destroy()`. Companions: `{Archetype, FollowDistance?=8, TeleportDistance?=60, Aura?, OnSummon?, OnDismiss?}`; one per session; intents `CP_Summon`/`CP_Dismiss`; hook `Companion.CanSummon` (fail-open); Bus `Companion.Summoned/Dismissed/Died`.
+
 `TeamKit.attach(kernel, {Teams = {[name] = {Color?, Capacity?}}, AutoAssign?=true, FriendlyFire?=false, SpawnTag?="TeamSpawn", UseSpawns?, SyncRoblox?, Seed?})` — `:assign(player, team) → bool` · `:teamOf(subject) → name?` (Player/session/character/npc handle via Faction) · `:sameTeam(a, b)` · `:players(team)` · `:emptiest()` · `:destroy()`. Vetoes `Weapon.CanDamage` + `Melee.CanHit` unless FriendlyFire; tagged `TeamSpawn` parts with a `Team` attribute own spawns; Bus `Team.Assigned(player, team, previous?)`.
 
 `MeleeKit.attach(kernel, {Moveset, BlockScale?=0.25, ParryWindow?=0.18, ParryCooldown?=0.6, StaggerSeconds?=1.1, GuardBreakStaggerScale?=1.5, LatencySlack?=0.075, TickSeconds?=0.05, Intents?=true, Clock?, GetPosition?, GetFacing?, SkipLoop?})` — `:register(entity, {Humanoid?}?)` · `:unregister(entity)` · `:attack(entity, name) → bool` · `:block(entity, down) → bool` · `:parry(entity) → bool` · `:canAttack(entity, name)` · `:state(entity)` · `:destroy()`. Attacks: `{Damage, Range?=7, Arc?=120, Windup?=0.2, Recovery?=0.3, ComboNext?, GuardBreak?, OnHit?}`. Player intents `ML_Attack`/`ML_Block`/`ML_Parry` auto-wire fail-closed; npc victims with `.defend` roll their skill-scaled reaction as the parry. Hook `Melee.CanHit` (fail-open); Bus `Melee.Hit/Blocked/GuardBroken/Parried/Staggered/Combo/State`.
@@ -2246,11 +2348,12 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `RoundKit.service({Phases, Replicas?, TickSeconds?=1})` | Phase: `{Name, Duration?, MinPlayers?}`; service `:advance()`, `:current()`; Bus `Round.PhaseChanged` |
 | `Projectiles.attach(kernel, {Rewind?, TickRate?=30}?)` · `:define(id, {Speed, Gravity?, MaxLifetime?=3, Hitbox?, OnHit?, OnExpire?})` · `:fire(session, id, origin, dir, timestamp?) → (ok, reason?)` | Server sim; Bus `Projectile.Hit`. Set `Hitbox = {Radius?, HalfHeight?}` to resolve player hits via capsule hitboxes (same shape/knobs as WeaponKit, honors the Rewind's `ShowHitboxes` display); without it, hits stay raw raycasts against character geometry and `OnHit` gets the engine RaycastResult |
 | `ProjectileClient.new({[id] = {Gravity?, Create, OnImpact?}}, {MaxVisuals?, MaxTracers?=300, ThreatRadius?=15}?)` · `.threatens(origin, velocity, position, radius)` | Pooled client visuals, same math as the server; `MaxVisuals` (defaults from the device profile) caps FULL visuals only — overflow renders as minimal pooled tracers, and shots passing within `ThreatRadius` of the local character always render full: no projectile is ever invisible to its target |
-| `Effects.attach(kernel)` · `:define(name, {Duration?, MaxStacks?=1, Stats? = {[stat]=multiplier}, OnApply?, OnExpire?})` · `:apply(session, name, {Duration?}?) → stacks` · `:remove` · `:has` · `:stacks` · `:statMultiplier(session, stat) → number` | Humanoid stats auto-applied; Bus `Effects.Applied/Expired` |
+| `Effects.attach(kernel)` · `:define(name, {Duration?, MaxStacks?=1, Stats? = {[stat]=multiplier}, Category?, Immune?, TickSeconds?, OnTick?, OnApply?, OnExpire?})` · `:apply(session, name, {Duration?}?) → stacks` (0 = blocked by an immune ward) · `:cleanse(session, category?) → count` · `:remove` · `:has` · `:stacks` · `:statMultiplier(session, stat) → number` | Humanoid stats auto-applied; periodic OnTick with bounded catch-up; owner `CKEffects` state push; Bus `Effects.Applied/Expired/Blocked/Cleansed` |
 | `Prediction.wrap(net, name, schema, {Predict?, TimeoutSeconds?=2}) → {fire → seq, OnResolved}` | Pairs with `Net:definePredictedIntent(name, schema, opts)` |
 | `Zones.attach(kernel, {IntervalSeconds?=0.25}?)` · `:add(name, part or {parts}, {OnEnter?, OnLeave?}?) → handle` · `:addPart(name, part)` · `:remove(name)` · `:addTagged(tag, {NameAttribute?="ZoneName"}?) → stop` · `:track(entity) → untrack` · `:trackTag(tag) → stop` · `:untrack(entity)` · `:playersIn(name)` · `:entitiesIn(name)` · `:isInside(name, occupant)` | Handle carries `Entered`/`Left` Signals firing `(occupant)`; Bus `Zone.Entered/Left` `(name, player)` for players, `Zone.EntityEntered/EntityLeft` `(name, entity)` for tracked entities (leaves before enters). `addTagged` builds zones from CollectionService tags — same-named parts union into one multi-part zone |
 | `Leaderstats.attach(kernel, {Display = {Field, From?, Kind?}}, opts?)` | Values track data on a 1s sweep |
 | `Leaderboards.attach(kernel, {Boards = {[name] = {Ascending?, KeepBest?=true, MaxEntries?=100, CacheSeconds?=60}}, FlushSeconds?=15, WritesPerFlush?=30, Backend?, StorePrefix?="CKBoard_", Clock?, SkipLoop?})` · `:submit(board, playerOrKey, value) → bool` · `:top(board, count?) → {{Key, Value, Rank}}` · `:flushNow()` · `:destroy()` | Global top-N on Roblox OrderedDataStores OR custom stores: backends implement declarative `submit(board, key, value, keepBest, ascending)` (external DBs apply keep-best atomically their way) or DataStore-shaped `set(board, key, updater)`, plus `sorted`; queued submits (newest per key per window), per-window write budget, cached reads, failed writes retry; Bus `Leaderboard.Updated` |
+| `Fuzz.run(kernel, {Session, Channels?, CasesPerChannel?=32, Seed?=1, IncludeRequests?=true, Driver?, Silent?})` · returns `{Channels, Cases, Passed, Rejected, HandlerErrors = {{Channel, Kind, Args, Error}}}` | Hostile payloads per schema type through the real hook chain + handler pipeline; validator throws count as rejects; deterministic per seed |
 | `Pool.new({Create, InitialSize?})` · `:acquire()` · `:release(instance)` · `:idleCount()` · `:destroy()` | |
 | `ErrorWatch.attach(kernel?, {WindowSeconds?=30}?)` · `:counts()` | Bus `Kernel.ScriptError(message, trace, source, count)` |
 | `LiveConfig.new(kernel, {Defaults, PollSeconds?=30})` · `:get(key)` · `:set(key, value)` | Bus `Config.Changed(key, value)`; `set(key, nil)` deletes the override and every server reverts to its default |
