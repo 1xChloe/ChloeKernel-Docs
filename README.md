@@ -64,8 +64,8 @@ Boot scripts are pre-wired: pressing Play runs the spec suites and boots both ke
 ```
 [TestKit] PASS — 175/175 tests across 23 specs
 [TestKit] PASS — 259/259 tests across 23 specs
-[ChloeKernel 0.2.0] Server booted 0 services in 0.01ms
-[ChloeKernel 0.2.0] Client booted 0 services in 0.01ms
+[ChloeKernel 0.3.0] Server booted 0 services in 0.01ms
+[ChloeKernel 0.3.0] Client booted 0 services in 0.01ms
 ```
 
 ## Core concepts
