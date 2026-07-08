@@ -31,6 +31,8 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Fire projectiles with travel time](#fire-projectiles-with-travel-time) | [Capture and deduplicate script errors](#capture-and-deduplicate-script-errors) |
 | [Make abilities feel instant](#make-abilities-feel-instant) | [Tune values live without redeploying](#tune-values-live-without-redeploying) |
 | [Bind abilities to movement, not just keys](#bind-abilities-to-movement-not-just-keys) | [Fight hand to hand, parries included](#fight-hand-to-hand-parries-included) |
+| [Give players an inventory](#give-players-an-inventory) | [Split players into teams](#split-players-into-teams) |
+| [Keep global top-100 boards](#keep-global-top-100-boards) | |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -407,6 +409,28 @@ If the second save fails the first is compensated back. Cross-server trades are 
 
 > **Status:** fully spec-verified including the rollback paths (abort, mutator crash, failed second save). Inherits the DataDriver's status above for the underlying saves.
 
+### Give players an inventory
+
+InventoryKit is the item model everything else was missing — a definition registry, slotted per-player bags with stacking, equip slots, and use handlers, persisted through the profile:
+
+```lua
+local Inventory = InventoryKit.attach(Kernel, {
+	MaxSlots = 30,
+	Items = {
+		Sword = { Stack = 1, Equip = "Primary", Meta = { Damage = 25 },
+			OnEquip = function(session, item) giveTool(session, "Sword") end },
+		Potion = { Stack = 10, OnUse = function(session)
+			healCharacter(session, 25)
+			return true -- consumed: one leaves the stack
+		end },
+	},
+})
+Inventory:grant(session, "Potion", 3) -- loot drops, shop purchases, quest rewards
+Inventory:take(session, "Potion", 1) -- crafting costs, trade escrow (all-or-nothing)
+```
+
+Grants and takes are **server-API-only** — no client message can mint an item. Clients get four fail-closed intents (`INV_Move`/`INV_Equip`/`INV_Unequip`/`INV_Use`) whose validators re-derive legality from the server's books, and the owner receives an `INV_Sync` state push after every mutation — inventory UI is purely a render problem. Stacking tops up piles before opening slots, `move` is the drag-and-drop primitive (swap or merge, equip references follow), equipping displaces the incumbent through its `OnUnequip`, and draining a stack auto-unequips. Hook points `Inventory.CanEquip`/`Inventory.CanUse` (fail-open) carry game rules like tournament locks. `Persist = false` keeps a bag session-only (battle-royale loadouts). Bus: `Inventory.Granted/Taken/Equipped/Unequipped/Used/Changed`.
+
 ### Run code when a player joins or leaves
 
 ```lua
@@ -762,6 +786,22 @@ end)
 ```
 
 End a round early with `Kernel:getService("RoundKit"):advance()`.
+
+### Split players into teams
+
+TeamKit is one source of truth wired into every combat gate — no kit needs to know teams exist:
+
+```lua
+local Teams = TeamKit.attach(Kernel, {
+	Teams = {
+		Raiders = { Color = Color3.fromRGB(200, 60, 60), Capacity = 8 },
+		Guards = { Color = Color3.fromRGB(60, 60, 200), Capacity = 8 },
+	},
+	SyncRoblox = true, -- player-list colors via real Team instances
+})
+```
+
+New sessions auto-balance onto the emptiest team (capacity-weighted, so a 2-cap duelist corner fills proportionally against 8-cap armies); `assign`/`teamOf`/`players`/`sameTeam` cover manual control. **Friendly fire is off by default** and enforced where damage actually happens: the kit registers vetoes on `Weapon.CanDamage` and `Melee.CanHit`, and npc handles resolve through their `Faction` — Raiders-faction NPCs and Raiders-team players read as teammates with zero extra wiring. Spawn ownership is map-authored: tag parts `TeamSpawn` with a `Team` attribute and characters pivot to an owned spawn (anti-exploit pardoned). Bus: `Team.Assigned(player, team, previous?)`.
 
 ### Fire projectiles with travel time
 
@@ -1296,6 +1336,23 @@ Leaderstats.attach(Kernel, {
 ```
 
 That's the whole integration — values track the data automatically.
+
+### Keep global top-100 boards
+
+Leaderstats is per-server; Leaderboards is the game-wide top-N on OrderedDataStores, with the persistence layer's budget discipline:
+
+```lua
+local Boards = Leaderboards.attach(Kernel, {
+	Boards = {
+		Kills = {}, -- descending, keep-best, top 100, 60s cache
+		BestTime = { Ascending = true }, -- speedruns: smaller wins
+	},
+})
+Boards:submit("Kills", session, killCount) -- queue: instant, allocation-cheap
+local Top = Boards:top("Kills", 10) -- {Key, Value, Rank} from cache
+```
+
+Submits queue and flush on a cadence — the newest value per player per window costs ONE write no matter how fast scores change, `KeepBest` boards only overwrite improvements (atomic `UpdateAsync`, no read-modify race), and failed writes stay queued for the next window instead of vanishing. `top()` serves a cached page so a hundred UI readers cost one `GetSortedAsync` per window, and a failed refresh keeps serving the previous page. The backend is injectable (specs run on a table; external services adapt). Bus: `Leaderboard.Updated(name, entries)` on refresh.
 
 ### Capture and deduplicate script errors
 
@@ -2124,6 +2181,10 @@ local Ok, Chunk = Pool:dispatch(chunkX, chunkZ) -- yields until the worker repli
 
 ### Kits
 
+`InventoryKit.attach(kernel, {Items, MaxSlots?=30, Persist?=true, Field?="Inventory"})` — `:grant(session, id, count?) → granted` · `:take(session, id, count?) → bool` (all-or-nothing) · `:count(session, id)` · `:move(session, from, to)` · `:equip(session, slotIndex)` · `:unequip(session, slotName)` · `:equipped(session, slotName) → (item?, index?)` · `:use(session, slotIndex)` · `:items(session)`. Items: `{Name?, Stack?=1, Kind?, Equip?, OnUse?, OnEquip?, OnUnequip?, Meta?}`. Client intents `INV_Move/Equip/Unequip/Use` fail-closed; owner state push `INV_Sync`; hooks `Inventory.CanEquip/CanUse` (fail-open); Bus `Inventory.Granted/Taken/Equipped/Unequipped/Used/Changed`.
+
+`TeamKit.attach(kernel, {Teams = {[name] = {Color?, Capacity?}}, AutoAssign?=true, FriendlyFire?=false, SpawnTag?="TeamSpawn", UseSpawns?, SyncRoblox?, Seed?})` — `:assign(player, team) → bool` · `:teamOf(subject) → name?` (Player/session/character/npc handle via Faction) · `:sameTeam(a, b)` · `:players(team)` · `:emptiest()` · `:destroy()`. Vetoes `Weapon.CanDamage` + `Melee.CanHit` unless FriendlyFire; tagged `TeamSpawn` parts with a `Team` attribute own spawns; Bus `Team.Assigned(player, team, previous?)`.
+
 `MeleeKit.attach(kernel, {Moveset, BlockScale?=0.25, ParryWindow?=0.18, ParryCooldown?=0.6, StaggerSeconds?=1.1, GuardBreakStaggerScale?=1.5, LatencySlack?=0.075, TickSeconds?=0.05, Intents?=true, Clock?, GetPosition?, GetFacing?, SkipLoop?})` — `:register(entity, {Humanoid?}?)` · `:unregister(entity)` · `:attack(entity, name) → bool` · `:block(entity, down) → bool` · `:parry(entity) → bool` · `:canAttack(entity, name)` · `:state(entity)` · `:destroy()`. Attacks: `{Damage, Range?=7, Arc?=120, Windup?=0.2, Recovery?=0.3, ComboNext?, GuardBreak?, OnHit?}`. Player intents `ML_Attack`/`ML_Block`/`ML_Parry` auto-wire fail-closed; npc victims with `.defend` roll their skill-scaled reaction as the parry. Hook `Melee.CanHit` (fail-open); Bus `Melee.Hit/Blocked/GuardBroken/Parried/Staggered/Combo/State`.
 
 `WeaponKit.service({Weapons, Rewind?, Ammo?})` · `SpellKit.service({Spells, MaxMana?=100, ManaRegenPerSecond?=5})` · `CheckpointKit.service({FolderName?="Checkpoints", MinimumLegitSeconds?=3, StageField?="BestStage"}?)` · `ProceduralKit.service({Archetypes, RegenSecondsPerModel?=0.25})` — each returns a service definition for `kernel:registerService`. ProceduralKit: `spawn(name, {CFrame?, Size?, Params?, Parent?, Owner?}) -> handle` (`handle:set/patch/resize/regenerate/waitForGeneration/destroy`), `validate(name, params) -> (ok, cleanedOrReason)` for wiring client customization intents.
@@ -2189,6 +2250,7 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `Prediction.wrap(net, name, schema, {Predict?, TimeoutSeconds?=2}) → {fire → seq, OnResolved}` | Pairs with `Net:definePredictedIntent(name, schema, opts)` |
 | `Zones.attach(kernel, {IntervalSeconds?=0.25}?)` · `:add(name, part or {parts}, {OnEnter?, OnLeave?}?) → handle` · `:addPart(name, part)` · `:remove(name)` · `:addTagged(tag, {NameAttribute?="ZoneName"}?) → stop` · `:track(entity) → untrack` · `:trackTag(tag) → stop` · `:untrack(entity)` · `:playersIn(name)` · `:entitiesIn(name)` · `:isInside(name, occupant)` | Handle carries `Entered`/`Left` Signals firing `(occupant)`; Bus `Zone.Entered/Left` `(name, player)` for players, `Zone.EntityEntered/EntityLeft` `(name, entity)` for tracked entities (leaves before enters). `addTagged` builds zones from CollectionService tags — same-named parts union into one multi-part zone |
 | `Leaderstats.attach(kernel, {Display = {Field, From?, Kind?}}, opts?)` | Values track data on a 1s sweep |
+| `Leaderboards.attach(kernel, {Boards = {[name] = {Ascending?, KeepBest?=true, MaxEntries?=100, CacheSeconds?=60}}, FlushSeconds?=15, Backend?, StorePrefix?="CKBoard_", Clock?, SkipLoop?})` · `:submit(board, playerOrKey, value) → bool` · `:top(board, count?) → {{Key, Value, Rank}}` · `:flushNow()` · `:destroy()` | Global top-N on OrderedDataStores: queued submits (newest per key per window), KeepBest via atomic UpdateAsync, cached reads, failed writes retry; injectable backend; Bus `Leaderboard.Updated` |
 | `Pool.new({Create, InitialSize?})` · `:acquire()` · `:release(instance)` · `:idleCount()` · `:destroy()` | |
 | `ErrorWatch.attach(kernel?, {WindowSeconds?=30}?)` · `:counts()` | Bus `Kernel.ScriptError(message, trace, source, count)` |
 | `LiveConfig.new(kernel, {Defaults, PollSeconds?=30})` · `:get(key)` · `:set(key, value)` | Bus `Config.Changed(key, value)`; `set(key, nil)` deletes the override and every server reverts to its default |
