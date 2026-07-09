@@ -35,7 +35,8 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Keep global top-100 boards](#keep-global-top-100-boards) | [Roll loot with pity timers](#roll-loot-with-pity-timers) |
 | [Craft items at stations](#craft-items-at-stations) | [Sell things for coins](#sell-things-for-coins) |
 | [Summon familiars and pets](#summon-familiars-and-pets) | [Fuzz every channel with hostile payloads](#fuzz-every-channel-with-hostile-payloads) |
-| [Group players into parties](#group-players-into-parties) | |
+| [Group players into parties](#group-players-into-parties) | [Rig hair automatically and make it sway](#rig-hair-automatically-and-make-it-sway) |
+| [Dissolve things into drifting voxels](#dissolve-things-into-drifting-voxels) | |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -1260,6 +1261,36 @@ A lean verlet bone simulator built for what SmartBone-style modules get wrong: *
 
 **Boneless accessories move too.** Most catalog hair has no bones — `bindAccessory` (run automatically by `bindCharacter`) models the accessory as a swing-clamped pendulum hinged at its joint and steers whichever joint kind holds it on: Weld/Motor6D offsets rotate, **RigidConstraint** accessories steer the handle-side Attachment CFrame (nothing swapped or disabled), and WeldConstraints swap for an equivalent local Weld restored exactly on release. `AmbientWind = Vector3` gives the whole sim a procedural gusting breeze with zero wiring — hair drifts, capes breathe. For hanging things (tails, chains), bind with `Stiffness = 0` and let gravity own them; stiffness is pose-hold strength, not springiness.
 
+### Rig hair automatically and make it sway
+
+HairKit gives boneless catalog hair a real skeleton at runtime — EditableMesh in, hardware-skinned mesh out:
+
+```lua
+-- Client bulk manager: rigs every character's hair once, sway rides BonePhysics
+local Bones = BonePhysics.new()
+HairKit.attach(kernel, { BonePhysics = Bones })
+
+-- Or rig server-side so the boned mesh replicates to everyone once
+HairKit.server(kernel)
+```
+
+The pipeline is write-once, read-many: `plan()` partitions the mesh vertices into radial sectors and depth bands and emits a bone chain per sector (defaults: 3 sectors x 3 segments + root = 10 bones), every vertex weighted to at most 2 bones (`MaxInfluences`, clamped to 4); `rig()` injects the skeleton through `EditableMesh:AddBone`/`SetVertexBones`/`SetVertexBoneWeights`, bakes with `AssetService:CreateDataModelContentAsync`, and swaps the static skinned result into the MeshPart in place — the GPU deforms it natively and the EditableMesh never stays live. Sway is BonePhysics driving the baked Bone instances: one fixed-timestep stepper for every character, camera-distance culling, and the DeviceBench `MaxChains` budget, with zero per-accessory scripts and zero per-frame network traffic in either mode. `supported()` gates on the runtime's EditableMesh bone APIs; unsupported clients keep the `bindAccessory` pendulum fallback. Bus: `Hair.Rigged(character, meshPart, boneNames)`.
+
+### Dissolve things into drifting voxels
+
+Dissolve is a vertex-sampled voxelizer with noise-advected scatter (client VFX):
+
+```lua
+local Vfx = Dissolve.new()
+Vfx:play(banishedNpc.Model, { Duration = 1.5, Drift = Vector3.new(0, 8, 0), Spin = true })
+
+-- Manual mode: drive erosion yourself (proximity dissolves, breaking wards)
+local Controller = Vfx:play(wardWall, {})
+Controller:setProgress(0.5) -- half the surface eroded, noise-thresholded
+```
+
+MeshParts sample EditableMesh vertex positions (bounding-box grid for plain parts and denied meshes), points snap to a `DotSize` voxel grid and dedupe per cell, and each dot advects through a 3D Perlin field (`noiseVelocity = field sample * ScatterSpeed + Drift`) while fading out. `Reverse = true` assembles the target out of drifting voxels instead. Performance follows the framework rules: one Heartbeat stepper for every active dissolve, pooled dots written through `workspace:BulkMoveTo`, and a `MaxPoints` budget that scales 500..5000 by DeviceBench quality when unconfigured. `play()` hides the target locally only — broadcast the trigger through a state channel and play on every client for shared VFX.
+
 ### Ragdoll bodies that replicate for free
 
 ```lua
@@ -2396,6 +2427,10 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `Settings.attach(kernel, {Schema, Field?="Settings", RateLimit?=10})` · `:get(session, key)` · `:all(session)` · `:set(session, key, value)` · rule: `{Kind = "number"/"boolean"/"string"/"strings", Default, Min?, Max?, MaxLength?=64, MaxItems?=8}` | Allowlisted client writes: clamp/cap/rebuild through `Intent.Settings_Set`; persists via profile; Bus `Settings.Changed`. Client: `SettingsClient.new(net)` · `:fetch()` · `:get` · `:set` · `:onChanged(fn)` |
 | `Analytics.attach(kernel, {FlushSeconds?=10, MaxPerMinute?=120, Sample?, Destination?, WatchErrors?, Seed?}?)` · `:track(name, player?, value?, fields?) → bool` · `:stats via .Stats` · `:destroy()` (flushes) | Batched to `AnalyticsService:LogCustomEvent` or an injected destination; sampled/over-cap drops counted, never silent |
 | `BonePhysics.attach({Gravity?, Wind?, FixedHz?=60, MaxSubsteps?=3, MaxDistance?=100, MaxChains?=20, ShouldSimulate?}?)` · `:bind(part, {Damping?=0.92, Stiffness?=0.1, GravityScale?, WindScale?}?) → handle?` · `:bindParts({parts}, settings?)` · `:bindCharacter(model, settings?) → {handles}` · `:step(dt)` · `handle:destroy()` · `:destroy()` | Client-side verlet bone chains (shared module, `ReplicatedStorage.ChloeKernel.BonePhysics`); fixed timestep, culling with pose snap-back, chain budget (past `MaxChains` the nearest to camera win), teleport guard, Transform-slot writes, Destroying auto-unbind; unconfigured `MaxDistance`/`MaxChains` default from the device profile on clients |
+
+`HairKit.plan(vertices, {Root, Axis?=(0,-1,0), Sectors?=3, Segments?=3, MaxInfluences?=2}) → {Bones, Weights}` · `HairKit.rig(meshPart, {Sectors?, Segments?, MaxInfluences?, Axis?, Root?}?) → (ok, boneNamesOrReason)` (plan + AddBone/SetVertexBones/SetVertexBoneWeights + CreateDataModelContentAsync bake + in-place ApplyMesh) · `HairKit.supported()` · `HairKit.attach(kernel, {BonePhysics?, Characters?="All", Rig?, Match?, Settings?, OnRigged?}?)` (client bulk manager) · `HairKit.server(kernel, {Rig?, Match?}?)` (server rig: baked bones replicate once). Weights cap at MaxInfluences (max 4). Bus `Hair.Rigged(character, meshPart, boneNames)`.
+
+`Dissolve.new({MaxPoints?, Parent?}?) → sim` · `sim:play(target, {DotSize?=0.25, MaxPoints?, Duration?, ScatterSpeed?=14, NoiseScale?=0.08, Drift?=(0,6,0), Reverse?, Spin?, CustomDot?, OnDone?}?) → controller` (`controller:Stop()`, `controller:setProgress(0..1)` when Duration is nil) · `sim:destroy()` · pure `Dissolve.noiseVelocity/snap/gridPoints/sample`. Vertex-sampled voxels, per-cell dedup, Perlin advection, pooled dots via BulkMoveTo, one stepper; unconfigured MaxPoints scales 500..5000 by DeviceBench quality. Local-only VFX.
 | `Ragdoll.attach(kernel, {MaxActive?=16, AutoDeath?, CollisionGroup?, FrictionTorque?=60}?)` · `:enable(model, {Duration?, Impulse?}?) → bool` · `:release(model)` · `:isRagdolled(model)` · `:destroy()` — clients: `RagdollClient.listen(netClient)` | Build-once/toggle: Motor6D→limited BallSocket swap or AnimationConstraint cut with native-socket friction/limit tuning, NoCollision limb pairs, full restore; owner-client `CKRagdoll` push flips humanoid state, silences Animate, applies impulses, uprights on release; Bus `Ragdoll.Started/Ended` |
 | `AudioKit.attach(kernel, {Buses?, MaxChannels?=32, Parent?, Npcs?, Occlusion = {GetListener?, IsBlocked?, Pathfinding?, Grid?}?}?)` · `:register/registerBank` · `:play(name, opts?) → handle` · `:playAt(name, target, opts?)` · `:playMusic` · `:playLayers → {setWeights, resync, stop}` · `:speak` · `:duck(bus, scale) → release` · `:setBusVolume` · `:bindSettings(prefs, map)` · `:reverbZone(part, type)` · `:soundscape` · `:assetIds()` · `:destroy()`; `AudioKit.server(kernel) → {broadcast, playFor, broadcastAt}` · `audio:listen(netClient)` | Bank config: `{Id, Bus?, Volume?, Speed?, Looped?, Priority?, Pooled?, RollOff*, Cues?, Subtitle?, Duck?}`; handle: `stop(fade?)/setVolume/setSpeed`. Bus events `Audio.Cue/Subtitle/SubtitleEnded` |
 | `AnimKit.attach(kernel, {LoadTrack?}?)` · `:register/registerBank` (`{Id, Priority?, Speed?, FadeIn?, Looped?, Group?, Markers?}`) · `:attachRig(model) → rig` · `:assetIds()` · `:destroy()`; rig: `:play(name, {Fade?, Speed?, Weight?})` · `:stop/stopAll/setSpeed` · `:ik(name, {Type = "LookAt"/"Reach"/"Transform"/"Rotation", Target, ChainRoot?, EndEffector?, Weight?, FadeIn?, Properties?}) → {Control, setWeight, setTarget, release}` · `:destroy()` | Exclusive `Group`s crossfade; markers publish `Anim.Marker`; IK weights blend on the kit stepper; rigs die with their model |
