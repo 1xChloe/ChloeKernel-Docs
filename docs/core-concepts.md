@@ -60,6 +60,6 @@ Kernel.Bus:subscribe("Combat.*", function(topic, ...) end) -- whole family
 Kernel.Bus:publish("Combat.Kill", killerSession, victimSession)
 ```
 
-Security model: the client sends intents, never state; everything privileged lives in ServerScriptService where it cannot be decompiled; nothing the client says is trusted. Details in [Architecture & security](architecture-the-security-model.md#architecture--the-security-model).
+Security model: the client sends intents, never state; everything privileged lives in ServerScriptService where it cannot be decompiled; nothing the client says is trusted. Details in [Architecture & security](#architecture--the-security-model).
 
 ---

@@ -186,7 +186,7 @@ Built-in protections: session locks prevent rejoin-dupes, a failed load **kicks 
 
 Backends: `"DataStore"` (default), `"Memory"` (tests/Studio), `"Http"` for your own database — note the `Http` backend has never been pointed at a real API and its read-modify-write isn't atomic like `UpdateAsync` (the session lock makes collisions rare; an API wanting hard guarantees should add revision checks — see the module header).
 
-For smaller records, add `Codec = Serde.schema({...})` and profile data stores as packed buffers — or `Codec = "Auto"`, which infers a typed schema from `Defaults` (safe wide widths) **with extras enabled**, so fields added later persist adaptively before they are typed. See the [API reference](api-reference.md#datadriver) and [Serde](api-reference.md#serde--base64).
+For smaller records, add `Codec = Serde.schema({...})` and profile data stores as packed buffers — or `Codec = "Auto"`, which infers a typed schema from `Defaults` (safe wide widths) **with extras enabled**, so fields added later persist adaptively before they are typed. See the [API reference](#datadriver) and [Serde](#serde--base64).
 
 > **Status:** the loss-hardening logic (locks, retries, migrations, fail-safe loads, codecs) is fully spec-verified against the in-memory backend. To hit real DataStores in Studio, enable *Studio Access to API Services* in Game Settings. Two things only a live game can prove: DataStore throttling under real player counts, and the `BindToClose` flush during an actual server shutdown.
 
@@ -737,6 +737,17 @@ local Teams = TeamKit.attach(Kernel, {
 
 New sessions auto-balance onto the emptiest team (capacity-weighted, so a 2-cap duelist corner fills proportionally against 8-cap armies); `assign`/`teamOf`/`players`/`sameTeam` cover manual control. **Friendly fire is off by default** and enforced where damage actually happens: the kit registers vetoes on `Weapon.CanDamage` and `Melee.CanHit`, and npc handles resolve through their `Faction` — Raiders-faction NPCs and Raiders-team players read as teammates with zero extra wiring. Spawn ownership is map-authored: tag parts `TeamSpawn` with a `Team` attribute and characters pivot to an owned spawn (anti-exploit pardoned). Bus: `Team.Assigned(player, team, previous?)`.
 
+### Group players into parties
+
+PartyKit is same-server parties: invites with expiry, one party per player, leader flow, and roster pushes so party UI is a render problem:
+
+```lua
+local Parties = PartyKit.attach(Kernel, { MaxSize = 4, InviteTtlSeconds = 60 })
+Kernel.Bus:subscribe("Party.Joined", function(_, party, player) ... end)
+```
+
+Inviting while partyless creates the party on the first accept with the inviter as leader. Accepting leaves the current party. Leaders kick and promote; a leaving leader promotes the longest-standing member; the last member out disbands. Session end leaves the party and clears the player's invites in both directions. Clients drive everything through six fail-closed intents (`PT_Invite/Accept/Decline/Leave/Kick/Promote`, UserIds on the wire) and receive `PT_Sync` roster pushes plus `PT_Invited` notifications. Parties are NOT teams — they never touch the combat gates; `sameParty(a, b)` exists for games that want party friendly-fire, and `members(player)` feeds Matchmaking group queues (a partyless player is a party of one). Gate invites in the `Party.CanInvite` hook (blocklists, level requirements). Bus: `Party.Created/Disbanded/Joined/Left/Kicked/Invited/Promoted`.
+
 ### Fire projectiles with travel time
 
 The server simulates every trajectory (gravity, swept raycasts, lifetime); clients render pooled visuals running the same math:
@@ -1053,7 +1064,7 @@ Kernel.Bus:subscribe("Quest.Progress", function(_, player, questId, index, count
 Kernel.Bus:subscribe("Quest.Completed", function(_, player, questId) ... end)
 ```
 
-A quest is data: objectives count **bus topics the server publishes** ([the catalog](api-reference.md#built-in-hook-points--bus-topics) is the menu), so quests can't be spoofed — there is no client input to validate. By default an event counts for a session when any published arg is that session or its player; `Match` additionally pins an arg (a zone name, a weapon id), and `Filter = fn(session, topic, ...)` takes full control (required for actor-less topics like `Round.PhaseChanged`). Progress persists via `session.Profile` when a DataDriver is attached; `Repeatable` resets to fresh on completion (dailies). `assign`/`abandon`/`progress` on the service handle the rest.
+A quest is data: objectives count **bus topics the server publishes** ([the catalog](#built-in-hook-points--bus-topics) is the menu), so quests can't be spoofed — there is no client input to validate. By default an event counts for a session when any published arg is that session or its player; `Match` additionally pins an arg (a zone name, a weapon id), and `Filter = fn(session, topic, ...)` takes full control (required for actor-less topics like `Round.PhaseChanged`). Progress persists via `session.Profile` when a DataDriver is attached; `Repeatable` resets to fresh on completion (dailies). `assign`/`abandon`/`progress` on the service handle the rest.
 
 ### Let players interact with the world
 
@@ -1099,6 +1110,56 @@ Bones:bindParts({ TailRoot, Seg1, Seg2, Seg3 }, { Stiffness = 0.05 })
 A lean verlet bone simulator built for what SmartBone-style modules get wrong: **fixed-timestep** solving (no frame-rate-dependent droop), flat arrays instead of per-bone objects, camera-distance **culling** that snaps back to the pose on wake, a **teleport guard** so respawns don't whip chains across the map, and a leak-free lifecycle — roots auto-unbind on `Destroying`, and poses are written through `Bone.Transform` (the animation slot), never `WorldCFrame`, so `destroy()` hands the skeleton back exactly as it found it. Chain roots stay rig-owned; physics only swings the children.
 
 **Boneless accessories move too.** Most catalog hair has no bones — `bindAccessory` (run automatically by `bindCharacter`) models the accessory as a swing-clamped pendulum hinged at its joint and steers whichever joint kind holds it on: Weld/Motor6D offsets rotate, **RigidConstraint** accessories steer the handle-side Attachment CFrame (nothing swapped or disabled), and WeldConstraints swap for an equivalent local Weld restored exactly on release. `AmbientWind = Vector3` gives the whole sim a procedural gusting breeze with zero wiring — hair drifts, capes breathe. For hanging things (tails, chains), bind with `Stiffness = 0` and let gravity own them; stiffness is pose-hold strength, not springiness.
+
+### Rig hair automatically and make it sway
+
+HairKit gives boneless catalog hair a real skeleton at runtime — EditableMesh in, hardware-skinned mesh out:
+
+```lua
+-- Client bulk manager: rigs every character's hair once, sway rides BonePhysics
+local Bones = BonePhysics.new()
+HairKit.attach(kernel, { BonePhysics = Bones })
+
+-- Or rig server-side so the boned mesh replicates to everyone once
+HairKit.server(kernel)
+```
+
+The pipeline is write-once, read-many: `plan()` partitions the mesh vertices into radial sectors and depth bands and emits a bone chain per sector (defaults: 3 sectors x 3 segments + root = 10 bones), every vertex weighted to at most 2 bones (`MaxInfluences`, clamped to 4); `rig()` injects the skeleton through `EditableMesh:AddBone`/`SetVertexBones`/`SetVertexBoneWeights`, registers the content into the DataModel with `AssetService:CreateDataModelContentAsync(Content.fromObject(mesh))`, bakes through `CreateMeshPartAsync`, swaps the skinned result into the MeshPart in place, and creates the Bone instance skeleton the mesh links to by name — the GPU deforms it natively and the baked editable stays rooted but is never mutated again. Sway is BonePhysics driving those Bone instances: one fixed-timestep stepper for every character, camera-distance culling, and the DeviceBench `MaxChains` budget, with zero per-accessory scripts and zero per-frame network traffic in either mode. Bus: `Hair.Rigged(character, meshPart, boneNames)`.
+
+Two independent permission gates apply. The experience setting **Allow Mesh & Image APIs** (Game Settings > Security) gates every EditableMesh call; `supported()` probes it with a real `AddBone` call and caches the result. `CreateEditableMeshAsync` additionally requires experience-owned or creator-owned meshes — third-party catalog hair rejects with "no permission to load asset" and `rig()` returns `(false, reason)` for that accessory only. Either failure keeps the `bindAccessory` pendulum fallback, so use owned hair assets for full vertex-skinned sway.
+
+### Dissolve things into drifting voxels
+
+Dissolve is a vertex-sampled voxelizer with noise-advected scatter (client VFX):
+
+```lua
+local Vfx = Dissolve.new()
+Vfx:play(banishedNpc.Model, { Duration = 1.5, Drift = Vector3.new(0, 8, 0), Spin = true })
+
+-- Manual mode: drive erosion yourself (proximity dissolves, breaking wards)
+local Controller = Vfx:play(wardWall, {})
+Controller:setProgress(0.5) -- half the surface eroded, noise-thresholded
+```
+
+MeshParts sample EditableMesh vertex positions (plain parts and denied meshes sample a surface shell — Ball and Cylinder filter to their true silhouette and interior cells drop, so nothing dissolves as a filled box), points snap to a `DotSize` voxel grid and dedupe per cell, and each dot advects through a 3D Perlin field (`noiseVelocity = field sample * ScatterSpeed + Drift`) while fading out. `Reverse = true` assembles the target out of drifting voxels instead. Home positions ride the target's anchor part (PrimaryPart or the part itself), so reassembly and morph landings follow a moving target — a player who walks off mid-effect reforms where they are, not where they stood. Dots above the erosion threshold ease back to their surface cell and resolidify (`ReturnSpeed`), so a manual controller restructures the target when its driver recedes — walk away from the proximity ward and it knits itself shut. Performance follows the framework rules: one Heartbeat stepper for every active effect, pooled dots written through `workspace:BulkMoveTo`, and a `MaxPoints` budget that scales 500..5000 by DeviceBench quality when unconfigured. `play()` hides the target locally only — broadcast the trigger through a state channel and play on every client for shared VFX.
+
+Morphs turn one thing into another through the same particles — avatars included:
+
+```lua
+-- Disintegrate an avatar and reform it. Chunks keep the original detail
+Vfx:play(character, { Duration = 1.6, Spin = true, DotSize = 0.3, Chunks = true, OnDone = reform })
+
+-- Morph an avatar into a statue, then back, then reform the statue
+Vfx:morph(character, golemStatue, { Duration = 1.6, OnDone = function()
+    Vfx:morph(golemStatue, character, { OnDone = function()
+        Vfx:play(golemStatue, { Reverse = true }) -- the statue was the return flight's source
+    end })
+end })
+```
+
+`morph(source, destination)` voxelizes the source and flies every dot into the destination's sampled shape: pairs assign bottom-up (`pairPoints`, every destination cell used), launches stagger by dot key (`Stagger`), flights arc through Perlin turbulence (`Turbulence`) and lerp source color to destination color, then the destination reveals (`Reveal`) and the source stays hidden. Character targets hide Decals and Textures with their parts, so faces and clothing vanish cleanly. Positions sample once at call time.
+
+Avatars are catalog meshes the experience cannot editable-load, so their voxel sampling falls back to bounding-box grids — blocky silhouettes. `Chunks = true` fixes that on both `play()` and `morph()`: every source part clones as a full-detail flying chunk (meshes, textures, faces, SurfaceAppearance survive; joints, welds, sounds, and emitters strip) that rides the same noise field or morph flight while shrinking into the dust. Detail stays perfect at launch and melts into particulate instead of starting squared. Chunks respect the erosion threshold, so partial dissolves and restructures work on them too. On meshes the experience owns, vertex sampling already yields detailed voxel shells without chunks.
 
 ### Ragdoll bodies that replicate for free
 
