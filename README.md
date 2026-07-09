@@ -36,7 +36,9 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Craft items at stations](#craft-items-at-stations) | [Sell things for coins](#sell-things-for-coins) |
 | [Summon familiars and pets](#summon-familiars-and-pets) | [Fuzz every channel with hostile payloads](#fuzz-every-channel-with-hostile-payloads) |
 | [Group players into parties](#group-players-into-parties) | [Rig hair automatically and make it sway](#rig-hair-automatically-and-make-it-sway) |
-| [Dissolve things into drifting voxels](#dissolve-things-into-drifting-voxels) | |
+| [Dissolve things into drifting voxels](#dissolve-things-into-drifting-voxels) | [Adapt replication to each player's connection](#adapt-replication-to-each-players-connection) |
+| [Query neighbors without touching the DataModel](#query-neighbors-without-touching-the-datamodel) | [Record exploiters for forensic replay](#record-exploiters-for-forensic-replay) |
+| [Author attachments in the map](#author-attachments-in-the-map) | [Recycle scratch tables in hot loops](#recycle-scratch-tables-in-hot-loops) |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -609,6 +611,22 @@ end)
 
 Detection is the kernel's job; the punishment policy is yours. Rubberbanding kicks in automatically after repeated strikes, and a flagged position never becomes the trusted baseline — exploiters can't launder a teleport through strikes.
 
+### Record exploiters for forensic replay
+
+Forensics is the anti-exploit flight recorder: every player's kinematics roll through a ring buffer, and the moment a watched topic flags someone, the window freezes into a capture and keeps recording through the tail:
+
+```lua
+Forensics.attach(Kernel, {
+    Destination = { Url = "https://my-tool.example/captures" }, -- POSTs the JSON
+})
+
+-- Studio: walk any capture as a ghost rig
+local Capture = Recorder:captures()[1]
+Forensics.replay(Capture, { Loop = true })
+```
+
+Frames are flat arrays `[t, px, py, pz, lx, ly, lz, vx, vy, vz, humanoidState]` at `RecordHz` (default 10) covering `WindowSeconds` before the flag (default 20) plus `TailSeconds` after (default 5) — the movement before, during, and after the violation as reconstructable data. A web tool can rebuild the run frame by frame from the JSON; `replay()` does it in Studio with an interpolated ghost. Re-flags during the tail append reasons to the same capture, leavers finalize immediately, delivery never blocks the sweep (function destinations and `{ Url }` POSTs both fail into the in-memory ring, last `MaxCaptures` always readable). Captures hold movement, reasons, and the user id only. Bus: `Forensics.Captured(player, capture)`.
+
 ### Validate hits with lag compensation
 
 The server keeps a position history ring and validates shots against where targets were at the client's timestamp — high-ping players hit what they aimed at; impossible shots are rejected:
@@ -656,6 +674,24 @@ Kernel.Bus:subscribe("Net.FloodDetected", function(_, player, bytes, payloadByte
 	noteStrike(player, "flood")
 end)
 ```
+
+### Adapt replication to each player's connection
+
+NetGovernor grades every client Good, Strained, or Poor from live link health and drives replication down to what the connection can carry:
+
+```lua
+-- Server
+NetGovernor.attach(Kernel)
+
+-- Client (bootstrap)
+GovernorClient.attach() -- readiness handshake, probe echoes, device hint
+
+Kernel.Bus:subscribe("Net.TierChanged", function(_, player, tier, stats)
+	print(player.Name, "->", tier, stats.PingMs, stats.Loss)
+end)
+```
+
+Measurement is threefold: ping median and jitter from `GetNetworkPing` samples, unreliable packet loss from sequence-numbered echo probes (probes hold until the client's readiness handshake, so join silence never reads as loss), and the client's DeviceBench quality hint (clamped, floor-to-Strained only — a weak device never grades Poor by itself). The worst axis wins. Two systems respond automatically: ReplicaService sends deltas to Strained clients every 2nd replica tick and Poor every 4th (skipped fields bank per subscriber and merge into their next send, so discrete state never goes missing — snapshots and removals always send, phases stagger per player), and unreliable state channels marked `Priority = "Low"` (the default) shed entirely to Poor clients while `"High"` traffic always flows. Shed counts land in `Governor.Stats`; thresholds and divisors are configurable. Bus: `Net.TierChanged(player, tier, stats)`.
 
 ### Share state across servers
 
@@ -715,6 +751,29 @@ end
 local Pool = ActorPool.new({ Size = 4, WorkerModule = script.PathWorker })
 local Ok, Waypoints = Pool:dispatch(npcPosition, targetPosition) -- yields
 ```
+
+Fork-join turns one batch into balanced parallel work — 50 NPC cover matrices while pathfinding recomputes a region, without choking a single thread:
+
+```lua
+-- Worker fn runs per item: return function(request, context) ... end
+local Ok, Results = Pool:forkJoin(CoverRequests, { Context = { Grid = GridVersion } })
+-- Results[i] corresponds to CoverRequests[i]; compose phases by forking again
+```
+
+The batch splits into chunks (default 4 waves per actor) and every actor pulls the next chunk the moment it finishes its last, so uneven items self-balance — a slow chunk never idles the rest of the pool. Results stitch back in item order and the calling coroutine resumes once with `(true, results)` or `(false, firstError)`; a failed item reports its absolute index, new sends stop, and outstanding chunks drain.
+
+### Recycle scratch tables in hot loops
+
+Per-frame sweeps that build temporary arrays feed the garbage collector. TablePool hands the same tables back instead:
+
+```lua
+local Scratch = TablePool.acquire()
+CharacterIndex:radiusInto(origin, 40, Scratch) -- Spatial's Into variants append, zero allocation
+consume(Scratch)
+TablePool.release(Scratch) -- cleared, capacity kept for the next acquire
+```
+
+NPCKit target prefilters, Projectiles candidate sets, and NetGovernor stats already ride the pool internally. Rules: a released table must not be held, double release fails loud, never release a table that escaped to a caller.
 
 ### Decouple systems with events
 
@@ -1097,6 +1156,48 @@ DungeonState:bindZone(Regions, "Dungeon") -- returns an unbind function
 
 Players outside the dungeon pay **zero bytes** for its state. Entering delivers the full snapshot the moment `Zone.Entered` fires — no waiting for the replica's next interest scan — and leaving unsubscribes the same way. The scan stays wired underneath (via `isInside`), so anyone already in the zone when the bind lands still converges.
 
+### Author attachments in the map
+
+Mounts turns Studio tagging into engine configuration. Tag an instance `CKMount`, set attributes, and the systems wire themselves at level load:
+
+```lua
+-- Server (Bootstrap): Zone mounts feed the zones service
+Mounts.attach(Kernel, { Zones = Regions })
+
+-- Client: the same tagged map wires audio emitters and physics chains
+Mounts.attach(Kernel, {
+	AudioKit = Audio,
+	BonePhysics = Bones,
+	Handlers = {
+		Torch = function(instance, attributes) -- custom types are one function
+			local Flame = spawnFlame(instance, attributes.Color)
+			return function() Flame:Destroy() end -- cleanup on unmount
+		end,
+	},
+})
+```
+
+A waterfall part with `MountType = "Sound"` and `SoundName = "Waterfall"` becomes a positional emitter; a doorway with `MountType = "Zone"` and `ZoneName = "Vault"` feeds `Zones:addPart`; a chain bridge part with `MountType = "BoneChain"` binds its bones into BonePhysics with per-instance `Damping`/`Stiffness`. Built-ins mount only when their system is passed, so the server attaches with Zones and the client with AudioKit and BonePhysics off one tagged map. Tag add/remove signals mount and unmount live, which makes StreamingEnabled maps work for free: what streams in mounts, what streams out cleans up. Bus: `Mount.Added(instance, mountType)`, `Mount.Removed(instance, mountType)`.
+
+### Query neighbors without touching the DataModel
+
+Spatial is a flat spatial-hash index: services register ids at positions and broad-phase queries replace full-roster scans and speculative raycasts:
+
+```lua
+local Index = Spatial.new({ CellSize = 8 })
+Index:set(entity, position) -- same-cell moves are just a write
+local Nearby = Index:radius(origin, 40)
+local Visible = Index:cone(eye, facing, 60, 120) -- radius + horizontal FOV dot
+local Closest, Distance = Index:nearest(origin)
+
+-- Kernel-wired: player character roots refresh at 10Hz
+local Characters = Spatial.characters(Kernel)
+Projectiles.attach(Kernel, { Spatial = Characters }) -- per-projectile radius instead of full scans
+NpcKit = NPCKit.attach(Kernel, { Spatial = Spatial.new() }) -- update() refreshes it, target scans broad-phase through it
+```
+
+The grid is pointer-free (packed integer cell keys, exact-filtered queries, coordinates clamp at half a million studs) and every query touches only the cells the volume covers — with hundreds of entities moving, sensor sweeps and threat scans read the index and spend engine raycasts on the survivors only. NPCKit pads its prefilter by one refresh of drift so a stale index never hides a real candidate, and Projectiles reads fresh root positions for the selected candidates so hit math stays exact.
+
 ### Give NPCs brains, aim skill, and movesets
 
 NPCKit is **helpers, not an AI runtime** — the kernel ships syscalls, and chase/cover/flank policy is game rules. The kit owns a thin spawn/despawn lifecycle plus per-npc state (skill model, senses memory, cooldowns); YOUR loop makes the decisions:
@@ -1291,7 +1392,9 @@ local Controller = Vfx:play(wardWall, {})
 Controller:setProgress(0.5) -- half the surface eroded, noise-thresholded
 ```
 
-MeshParts sample EditableMesh vertex positions (plain parts and denied meshes sample a surface shell — Ball and Cylinder filter to their true silhouette and interior cells drop, so nothing dissolves as a filled box), points snap to a `DotSize` voxel grid and dedupe per cell, and each dot advects through a 3D Perlin field (`noiseVelocity = field sample * ScatterSpeed + Drift`) while fading out. `Reverse = true` assembles the target out of drifting voxels instead. Home positions ride the target's anchor part (PrimaryPart or the part itself), so reassembly and morph landings follow a moving target — a player who walks off mid-effect reforms where they are, not where they stood. Dots above the erosion threshold ease back to their surface cell and resolidify (`ReturnSpeed`), so a manual controller restructures the target when its driver recedes — walk away from the proximity ward and it knits itself shut. Performance follows the framework rules: one Heartbeat stepper for every active effect, pooled dots written through `workspace:BulkMoveTo`, and a `MaxPoints` budget that scales 500..5000 by DeviceBench quality when unconfigured. `play()` hides the target locally only — broadcast the trigger through a state channel and play on every client for shared VFX.
+MeshParts sample EditableMesh vertex positions (plain parts and denied meshes sample a surface shell — Ball and Cylinder filter to their true silhouette and interior cells drop, so nothing dissolves as a filled box), points snap to a `DotSize` voxel grid and dedupe per cell, and each dot advects through a 3D Perlin field (`noiseVelocity = field sample * ScatterSpeed + Drift`) while fading out. `Reverse = true` assembles the target out of drifting voxels instead. Home positions ride the target's anchor part (PrimaryPart or the part itself), so reassembly and morph landings follow a moving target — a player who walks off mid-effect reforms where they are, not where they stood.
+
+Rest state is free. Settled dots, fully faded dots, and landed morph dots skip their frame entirely (a standing manual controller costs comparisons, not allocations), and a manual controller fully at rest for `HibernateSeconds` (default 2) releases its dots, trims the pool to `PoolKeep`, and shows the real target again — the next `setProgress` above zero re-materializes instantly from the cached sample. A proximity ward costs zero instances and zero allocation until someone walks up to it. Dots above the erosion threshold ease back to their surface cell and resolidify (`ReturnSpeed`), so a manual controller restructures the target when its driver recedes — walk away from the proximity ward and it knits itself shut. Performance follows the framework rules: one Heartbeat stepper for every active effect, pooled dots written through `workspace:BulkMoveTo`, and a `MaxPoints` budget that scales 500..5000 by DeviceBench quality when unconfigured. `play()` hides the target locally only — broadcast the trigger through a state channel and play on every client for shared VFX.
 
 Morphs turn one thing into another through the same particles — avatars included:
 
@@ -2345,7 +2448,7 @@ Kernel.Bus:publish("AntiExploit.Forgive", player) -- or Monitor:forgive(player)
 |---|---|
 | `Matchmaking.new(kernel, queueName, {TeamSize?=2, PlaceId?}?)` · `:enqueue(player)` · `:dequeue(player)` | Bus: `Matchmaking.Queued/Dequeued/MatchFound` |
 | `SoftShutdown.attach(kernel)` | Reserved-transit migration; no-op in Studio |
-| `ActorPool.new({Size, WorkerModule, Parent?, TimeoutSeconds?=10})` · `pool:dispatch(...) → (ok, result|err)` (yields) · `:destroy()` | WorkerModule returns a pure `function(...) → result` |
+| `ActorPool.new({Size, WorkerModule, Parent?, TimeoutSeconds?=10})` · `pool:dispatch(...) → (ok, result|err)` (yields) · `pool:forkJoin(items, {ChunkSize?, Context?}?) → (ok, results|firstError)` (yields) · `:destroy()` | WorkerModule returns a pure `function(...) → result`; forkJoin calls it as `fn(item, context)` per item, chunks default to 4 waves per actor, idle actors pull the next chunk (self-balancing), results stitch in item order, failures carry the item index |
 
 ```lua
 local Arena = Matchmaking.new(Kernel, "Arena", { TeamSize = 4, PlaceId = ARENA_PLACE })
@@ -2440,7 +2543,9 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `Leaderstats.attach(kernel, {Display = {Field, From?, Kind?}}, opts?)` | Values track data on a 1s sweep |
 | `Leaderboards.attach(kernel, {Boards = {[name] = {Ascending?, KeepBest?=true, MaxEntries?=100, CacheSeconds?=60}}, FlushSeconds?=15, WritesPerFlush?=30, Backend?, StorePrefix?="CKBoard_", Clock?, SkipLoop?})` · `:submit(board, playerOrKey, value) → bool` · `:top(board, count?) → {{Key, Value, Rank}}` · `:flushNow()` · `:destroy()` | Global top-N on Roblox OrderedDataStores OR custom stores: backends implement declarative `submit(board, key, value, keepBest, ascending)` (external DBs apply keep-best atomically their way) or DataStore-shaped `set(board, key, updater)`, plus `sorted`; queued submits (newest per key per window), per-window write budget, cached reads, failed writes retry; Bus `Leaderboard.Updated` |
 | `Fuzz.run(kernel, {Session, Channels?, CasesPerChannel?=32, Seed?=1, IncludeRequests?=true, Driver?, Silent?})` · returns `{Channels, Cases, Passed, Rejected, HandlerErrors = {{Channel, Kind, Args, Error}}}` | Hostile payloads per schema type through the real hook chain + handler pipeline; validator throws count as rejects; deterministic per seed |
-| `Pool.new({Create, InitialSize?})` · `:acquire()` · `:release(instance)` · `:idleCount()` · `:destroy()` | |
+| `Pool.new({Create, InitialSize?})` · `:acquire()` · `:release(instance)` · `:idleCount()` · `:trim(keep) → destroyed` · `:destroy()` | `trim` destroys idle instances beyond keep, live instances untouched |
+| `TablePool.acquire() → {}` · `TablePool.release(t)` · `TablePool.idleCount()` | Scratch Lua table recycling: release clears, capacity survives, double release fails loud, idle caps at 256; pair with Spatial `radiusInto`/`boxInto`/`coneInto` |
+| `Mounts.attach(kernel, {Tag?="CKMount", AudioKit?, Zones?, BonePhysics?, Handlers?}?) → {unmount(instance), destroy()}` | Tagged instances mount by `MountType` attribute: `Sound` (`SoundName`, `Volume?`, `Speed?`) via AudioKit `playAt`, `Zone` (`ZoneName`) via `Zones:addPart`, `BoneChain` (`Damping?`, `Stiffness?`, `GravityScale?`, `WindScale?`) via BonePhysics `bind`; `Handlers` override built-ins and add custom types returning cleanup closures; tag signals mount and unmount live (streaming-safe); bus `Mount.Added/Removed` |
 | `ErrorWatch.attach(kernel?, {WindowSeconds?=30}?)` · `:counts()` | Bus `Kernel.ScriptError(message, trace, source, count)` |
 | `LiveConfig.new(kernel, {Defaults, PollSeconds?=30})` · `:get(key)` · `:set(key, value)` | Bus `Config.Changed(key, value)`; `set(key, nil)` deletes the override and every server reverts to its default |
 | `Pathfinding.attach(kernel?)` · `:find({Method?="Direct", Start, Goal, Grid?, MaxExpansions?, Exclude?, AgentParams?}) → (ok, waypointsOrReason)` · `:distanceField({Grid, Origin, MaxDistance?}) → {[cellKey] = studs}?` · `Pathfinding.follower({Paths, Grid, Method?="ThetaStar", RepathDistance?, ArriveDistance?, Clock?}) → follower` · `follower:step(position, goal) → (nextPoint, {Path?, Jump, Stuck})` · `follower:reset()` · `Pathfinding.grid({Origin, Width, Height, CellSize?=4, AgentHeight?=6, MaxStepHeight?=4, IsWalkable?}) → grid` · `grid:refresh()` · `grid:refreshRegion(minWorld, maxWorld)` · `grid:addLink(fromWorld, toWorld, cost?)` · `grid:groundY(x, z)` · `grid:nearestWalkable(position, maxCells?=8) → Vector3?` · `grid:lineOfSight(x0, z0, x1, z1)` (feet) · `grid:sightLine(x0, z0, x1, z1)` (eyes) | Methods `AStar`/`ThetaStar`/`Direct`/`Roblox`, lazily required; failures return reasons (`GoalBlocked`, `NoPath`, `BudgetExhausted`, ...); `Roblox` yields (the follower runs it off-thread). Default rasterizer raycasts ground (Terrain + CanCollide parts), waypoints ride elevation, `MaxStepHeight` refuses cliffs per step AND along straight lines; walkable high ground occludes sight, valleys only block feet. `refresh` bumps `grid.Version` so followers re-path |
@@ -2449,11 +2554,14 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `BonePhysics.attach({Gravity?, Wind?, FixedHz?=60, MaxSubsteps?=3, MaxDistance?=100, MaxChains?=20, ShouldSimulate?}?)` · `:bind(part, {Damping?=0.92, Stiffness?=0.1, GravityScale?, WindScale?}?) → handle?` · `:bindParts({parts}, settings?)` · `:bindCharacter(model, settings?) → {handles}` · `:step(dt)` · `handle:destroy()` · `:destroy()` | Client-side verlet bone chains (shared module, `ReplicatedStorage.ChloeKernel.BonePhysics`); fixed timestep, culling with pose snap-back, chain budget (past `MaxChains` the nearest to camera win), teleport guard, Transform-slot writes, Destroying auto-unbind; unconfigured `MaxDistance`/`MaxChains` default from the device profile on clients |
 
 | `HairKit.plan(vertices, {Root, Axis?=(0,-1,0), Sectors?=3, Segments?=3, MaxInfluences?=2}) → {Bones, Weights}` · `HairKit.rig(meshPart, {Sectors?, Segments?, MaxInfluences?, Axis?, Root?}?) → (ok, boneNamesOrReason)` · `HairKit.supported()` · `HairKit.attach(kernel, {BonePhysics?, Characters?="All", Rig?, Match?, Settings?, OnRigged?}?)` (client bulk manager) · `HairKit.server(kernel, {Rig?, Match?}?)` (server rig: baked bones replicate once) | Skeleton plan + `AddBone`/`SetVertexBones`/`SetVertexBoneWeights` + `CreateDataModelContentAsync(Content.fromObject)` registration + `CreateMeshPartAsync` bake + in-place `ApplyMesh` + Bone instance skeleton (name-linked); weights cap at `MaxInfluences` (max 4); needs the "Allow Mesh & Image APIs" experience setting (`supported()` probes it) and owned meshes (third-party catalog assets return `(false, reason)`); bus `Hair.Rigged(character, meshPart, boneNames)` |
-| `Dissolve.new({MaxPoints?, Parent?}?) → sim` · `sim:play(target, {DotSize?=0.25, MaxPoints?, Duration?, ScatterSpeed?=14, NoiseScale?=0.08, Drift?=(0,6,0), Reverse?, Spin?, ReturnSpeed?=8, Chunks?, CustomDot?, OnDone?}?) → controller` · `sim:morph(source, destination, {Duration?=1.5, Turbulence?=4, Stagger?=0.35, DotSize?, MaxPoints?, NoiseScale?, Spin?, Chunks?, CustomDot?, Reveal?=true, OnDone?}?) → controller` · `controller:Stop()` · `controller:setProgress(0..1)` when Duration is nil · `sim:destroy()` · pure `Dissolve.noiseVelocity/snap/surfacePoints/gridPoints/sample/pairPoints/morphAlpha` | Vertex-sampled voxels (surface-shell fallback filters Ball/Cylinder to their silhouette, interior cells drop), per-cell dedup, Perlin advection, above-threshold dots ease home and resolidify (restructure), homes ride the target's anchor part so effects follow moving targets, morphs fly dots into the destination shape with bottom-up pairing, staggered launches, turbulence arcs, and color lerp, then reveal the destination; `Chunks` clones source parts as full-detail flying pieces that shrink into the dust (avatar detail without mesh read permission); avatars hide Decals/Textures with their parts; pooled dots via `BulkMoveTo`, one Heartbeat stepper; unconfigured `MaxPoints` scales 500..5000 by DeviceBench quality; local-only VFX |
+| `Dissolve.new({MaxPoints?, Parent?, PoolKeep?=64}?) → sim` · `sim:play(target, {DotSize?=0.25, MaxPoints?, Duration?, ScatterSpeed?=14, NoiseScale?=0.08, Drift?=(0,6,0), Reverse?, Spin?, ReturnSpeed?=8, HibernateSeconds?=2, Chunks?, CustomDot?, OnDone?}?) → controller` · `sim:morph(source, destination, {Duration?=1.5, Turbulence?=4, Stagger?=0.35, DotSize?, MaxPoints?, NoiseScale?, Spin?, Chunks?, CustomDot?, Reveal?=true, OnDone?}?) → controller` · `controller:Stop()` · `controller:setProgress(0..1)` when Duration is nil · `sim:destroy()` · pure `Dissolve.noiseVelocity/snap/surfacePoints/gridPoints/sample/pairPoints/morphAlpha` | Vertex-sampled voxels (surface-shell fallback filters Ball/Cylinder to their silhouette, interior cells drop), per-cell dedup, Perlin advection, above-threshold dots ease home and resolidify (restructure), homes ride the target's anchor part so effects follow moving targets, morphs fly dots into the destination shape with bottom-up pairing, staggered launches, turbulence arcs, and color lerp, then reveal the destination; `Chunks` clones source parts as full-detail flying pieces that shrink into the dust (avatar detail without mesh read permission); avatars hide Decals/Textures with their parts; pooled dots via `BulkMoveTo`, one Heartbeat stepper; unconfigured `MaxPoints` scales 500..5000 by DeviceBench quality; local-only VFX |
 | `Ragdoll.attach(kernel, {MaxActive?=16, AutoDeath?, CollisionGroup?, FrictionTorque?=60}?)` · `:enable(model, {Duration?, Impulse?}?) → bool` · `:release(model)` · `:isRagdolled(model)` · `:destroy()` — clients: `RagdollClient.listen(netClient)` | Build-once/toggle: Motor6D→limited BallSocket swap or AnimationConstraint cut with native-socket friction/limit tuning, NoCollision limb pairs, full restore; owner-client `CKRagdoll` push flips humanoid state, silences Animate, applies impulses, uprights on release; Bus `Ragdoll.Started/Ended` |
 | `AudioKit.attach(kernel, {Buses?, MaxChannels?=32, Parent?, Npcs?, Occlusion = {GetListener?, IsBlocked?, Pathfinding?, Grid?}?}?)` · `:register/registerBank` · `:play(name, opts?) → handle` · `:playAt(name, target, opts?)` · `:playMusic` · `:playLayers → {setWeights, resync, stop}` · `:speak` · `:duck(bus, scale) → release` · `:setBusVolume` · `:bindSettings(prefs, map)` · `:reverbZone(part, type)` · `:soundscape` · `:assetIds()` · `:destroy()`; `AudioKit.server(kernel) → {broadcast, playFor, broadcastAt}` · `audio:listen(netClient)` | Bank config: `{Id, Bus?, Volume?, Speed?, Looped?, Priority?, Pooled?, RollOff*, Cues?, Subtitle?, Duck?}`; handle: `stop(fade?)/setVolume/setSpeed`. Bus events `Audio.Cue/Subtitle/SubtitleEnded` |
 | `AnimKit.attach(kernel, {LoadTrack?}?)` · `:register/registerBank` (`{Id, Priority?, Speed?, FadeIn?, Looped?, Group?, Markers?}`) · `:attachRig(model) → rig` · `:assetIds()` · `:destroy()`; rig: `:play(name, {Fade?, Speed?, Weight?})` · `:stop/stopAll/setSpeed` · `:ik(name, {Type = "LookAt"/"Reach"/"Transform"/"Rotation", Target, ChainRoot?, EndEffector?, Weight?, FadeIn?, Properties?}) → {Control, setWeight, setTarget, release}` · `:destroy()` | Exclusive `Group`s crossfade; markers publish `Anim.Marker`; IK weights blend on the kit stepper; rigs die with their model |
 | `Preload.run(kernel, {Assets?, Banks?, BatchSize?=16}?) → {Done, Loaded, Total, Failed, await()}` | Batched `PreloadAsync`; Bus `Preload.Started/Progress/Done`; failures collect, never abort |
+| `Spatial.new({CellSize?=8}?) → index` · `index:set(id, position)` · `:remove(id)` · `:position(id)` · `:count()` · `:clear()` · `:radius(position, r) → {id}` · `:box(min, max)` · `:cone(origin, direction, range, fovDegrees)` · `:radiusInto/boxInto/coneInto(..., out) → out` (append, zero-alloc) · `:nearest(position, maxRadius?) → (id?, distance?)` · `Spatial.characters(kernel, {CellSize?, Hz?=10}?) → index` (`index:destroy()`) | Flat spatial hash, packed integer cell keys, exact-filtered queries, coordinates clamp at +-524k studs; same-cell set() is a position write; consumers: `Projectiles.attach {Spatial}` per-projectile candidate radius, `NPCKit.attach {Spatial}` update()-refreshed broad-phase for target scans |
+| `NetGovernor.attach(kernel, {PingEvery?=1, ProbeHz?=4, Window?=10, LossWindow?=40, Thresholds?, Divisors?={1,2,4}, DeviceStrainQuality?=0.5, PingProvider?, Net?, Clock?, SkipLoops?}?)` · `:tierOf(player)` · `:statsOf(player)` · `:divisorFor(player)` · `:shouldShed(player, priority)` · `:detach()` · pure `NetGovernor.evaluate(stats, thresholds?)` / `pingStats(samples)` — client: `GovernorClient.attach({ReportDevice?=true}?)` | Ping median + jitter (mean absolute deviation) + probe-echo loss + DeviceBench hint grade Good/Strained/Poor (worst axis wins, device floor caps at Strained); probes hold for the NG_Ready handshake; ReplicaService banks skipped deltas per subscriber (owed-merge, staggered phases), unreliable channels shed `Priority = "Low"` to Poor links; `defineUnreliableState(name, schema, {Priority?})`; bus `Net.TierChanged(player, tier, stats)` |
+| `Forensics.attach(kernel, {RecordHz?=10, WindowSeconds?=20, TailSeconds?=5, Topics?={"AntiExploit.MovementViolation"}, Destination?, MaxCaptures?=8, Clock?, Sampler?, Http?, SkipLoop?}?)` · `:captures()` · `:flag(player, reason, ...)` · `:export(capture) → json` · `:detach()` · `Forensics.replay(capture, {Parent?, TimeScale?=1, Loop?}?) → {Stop}` · pure `Forensics.frameAt(frames, t)` | Kinematic ring per player (frames `[t, position, look, velocity, humanoidState]`), flag freezes the window + records the tail, re-flags append reasons, leavers finalize; destinations: function or `{ Url }` JSON POST, failures fall into the in-memory ring; replay = interpolated ghost rig; bus `Forensics.Captured(player, capture)` |
 | `DeviceBench.run({BudgetMs?=90, Frames?=0, Force?, Clock?, Bus?}?) → {Score, Quality, Axes{Compute, Churn, Resume}, Tier, ComputePerSecond, ChurnPerSecond, ResumePerSecond, Platform, FrameMs?}` · `.profile(resultOrQualityOrTier?) → Profile` · `.quality(result?) → number` · `.axes(measures) → Axes` · `.scale(min, max, result?)` · `.pick(byTier, result?)` · `.tier(result?)` · `.score(measures) → (score, tier)` · `.governor({TargetFps?=60, Result?, Manual?, Clock?, Bus?, OnChange?}?) → {Quality, Tier, sample(dt), profile(), stop()}` | Time-boxed device benchmark (compute + churn + resumes); Quality and each axis are continuous 0.25..4 multipliers vs a mid-range reference (decimals allowed; tiers Low/Medium/High/Ultra remain coarse conveniences); Profile budgets `{ViewDistance, VfxDensity, ParticleBudget, ShadowsEnabled, PostFx, BoneChains, BoneDistance, AudioChannels, ProjectileVisuals}` are funded by the axis that pays each cost (Churn → particles/vfx, Compute → bones/projectile visuals, Resume → channels) and consumed by unconfigured BonePhysics `MaxDistance`/`MaxChains`, AudioKit `MaxChannels`, ProjectileClient `MaxVisuals`; `scale` is log2-mapped (each quality doubling buys the same slice); governor holds TargetFps by nudging effective quality ×0.8 after ~3s of p95 misses / ×1.15 after ~10s of headroom, capped at the benched quality, axis ratios preserved (Bus `Device.QualityChanged(quality, profile)`). Client measurement — cosmetics, never authority |
 
 ### TestKit / Bench

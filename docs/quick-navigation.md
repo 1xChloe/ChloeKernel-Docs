@@ -24,7 +24,9 @@
 | [Craft items at stations](#craft-items-at-stations) | [Sell things for coins](#sell-things-for-coins) |
 | [Summon familiars and pets](#summon-familiars-and-pets) | [Fuzz every channel with hostile payloads](#fuzz-every-channel-with-hostile-payloads) |
 | [Group players into parties](#group-players-into-parties) | [Rig hair automatically and make it sway](#rig-hair-automatically-and-make-it-sway) |
-| [Dissolve things into drifting voxels](#dissolve-things-into-drifting-voxels) | |
+| [Dissolve things into drifting voxels](#dissolve-things-into-drifting-voxels) | [Adapt replication to each player's connection](#adapt-replication-to-each-players-connection) |
+| [Query neighbors without touching the DataModel](#query-neighbors-without-touching-the-datamodel) | [Record exploiters for forensic replay](#record-exploiters-for-forensic-replay) |
+| [Author attachments in the map](#author-attachments-in-the-map) | [Recycle scratch tables in hot loops](#recycle-scratch-tables-in-hot-loops) |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
