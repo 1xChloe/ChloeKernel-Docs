@@ -82,7 +82,7 @@ local Stock = Net.GetStock.invoke(3)
 local Dash = Net.Dash.predict({ Predict = dashLocally }) -- Prediction.wrap underneath
 ```
 
-Rules: `Range = {min, max}` (numbers, inclusive), `OneOf = {...}` (allowed values), `MaxLength = n` (strings). They install at priority 5, ahead of game validators, and REJECT — type coercion already clamps values into the wire type; rules express game limits the schema cannot. `Registry.define` shape-checks the table at load, so a typo'd `Kind` fails the boot instead of a random send later.
+Rules: `Range = {min, max}` (numbers, inclusive), `OneOf = {...}` (allowed values), `MaxLength = n` (strings). They install at priority 5, ahead of game validators, and REJECT. Channel integers WRAP into the wire type (a 300 sent as `NumberU8` arrives as 44 — replica Serde fields clamp instead), so rules are the layer that catches out-of-range payloads. `Registry.define` shape-checks the table at load, so a typo'd `Kind` fails the boot instead of a random send later.
 
 ### Push updates to clients
 
@@ -134,7 +134,7 @@ To show different players different data (team-only info, proximity), pass `Inte
 
 **Slimming the wire.** Per-recipient deltas are already small (the NET window's fan-out totals are `per-message bytes x recipients`, not one buffer); the levers that shrink them further, cheapest first:
 
-- **Pick the narrowest type that fits.** Every field costs exactly its width: `NumberU8` 1B, `NumberU16` 2B, `NumberU24` 3B, `NumberU32` 4B, `Vector3S16` 6B (integer studs), `Vector3F24` 9B, `Vector3F32` 12B, `Boolean1` packs 8 flags into 1 byte. A score that can't exceed 16M in `NumberU24` instead of `NumberU32` saves a byte on every delta forever.
+- **Pick the narrowest type that fits.** Every field costs exactly its width: `NumberU8` 1B, `NumberU16` 2B, `NumberU24` 3B, `NumberU32` 4B, `Vector3S16` 6B (integer studs), `Vector3F24` 9B, `Vector3F32` 12B, `Boolean8` 1B (channel schemas additionally offer `Boolean1`, packing 8 flags into 1 byte — replica schemas do not). A score that can't exceed 16M in `NumberU24` instead of `NumberU32` saves a byte on every delta forever.
 - **Quantize chatty fields.** `Quantize = { Position = 0.1 }` deadbands a field: writes that moved less than the threshold from the *last replicated* value update server data but skip the wire entirely. Drift is bounded by the threshold (slow movement still replicates once it accumulates), so pick the error nobody can see. A 20Hz position wiggling by hundredths of a stud goes from 20 deltas/s to zero.
 - **Lower `TickRate`.** Dirty fields coalesce until the replica's own cadence — a 4Hz scoreboard batches everything that changed in 250ms into one delta envelope instead of fifteen.
 - **Split replicas by audience and cadence.** One fast small replica (positions, 20Hz, `Interest`-scoped) plus one slow wide one (stats, 2Hz, broadcast) beats a single replica ticking everything at the fastest field's rate.
@@ -1098,7 +1098,7 @@ The handle's helpers are the vocabulary: `updateTarget` (acquisition, sight memo
 
 Difficulty is nine knobs, not a vibe: **AimErrorDegrees** (per-axis spray), **ReactionSeconds** (delay between noticing and acting), **LeadSkill** (0..1 of the ideal moving-target intercept), **CooldownMultiplier** (attack pace), **HearingMultiplier**, **HearingBlurStuds**, **PathSkill** (routing quality), **DefenseSkill** (0..1 parry/deflect success), and **FieldOfViewDegrees** (the vision cone — `Perfect` scans 360, `Bad` sees 100 in front). `Perfect` is an aimbot, `HumanPeak` is plausible-human-limit, `Bad` can't hit a barn — and a custom table slots anywhere between. The same knobs shape guns, wizard projectiles, and forest creatures alike: `Kind = "Melee"` gates on range and swings `Damage`/`OnHit`, and `Kind = "Custom"` receives a pre-aimed direction so you can point it at the same server function a WeaponKit or SpellKit handler already calls. With `Zones` attached, spawned models fire `Zone.EntityEntered/Left`. Bus: `Npc.Spawned/Died/Action/Heard/Suspicious/Damaged/Reload/Windup`.
 
-NPCs also have **ears**. Player noise alerts them to a location, with accuracy scaled by skill — `Perfect` pinpoints the exact position, `Bad` hears a vague 30-stud blur:
+NPCs also have **ears**. Player noise alerts them to a location, with accuracy scaled by skill — `Perfect` pinpoints the exact position, `Bad` hears a vague 32-stud blur:
 
 ```lua
 local Npcs = NPCKit.attach(Kernel, {
@@ -1216,7 +1216,7 @@ HairKit gives boneless catalog hair a real skeleton at runtime — EditableMesh 
 
 ```lua
 -- Client bulk manager: rigs every character's hair once, sway rides BonePhysics
-local Bones = BonePhysics.new()
+local Bones = BonePhysics.attach()
 HairKit.attach(kernel, { BonePhysics = Bones })
 
 -- Or rig server-side so the boned mesh replicates to everyone once
@@ -1395,7 +1395,7 @@ local MyPrefs = SettingsClient.new(Net)
 MyPrefs:fetch()
 MyPrefs:set("MusicVolume", 0.8)
 MyPrefs:onChanged(function(key, value)
-	if key == "DashKeys" then Input:rebind("Dash", toKeyCodes(value)) end
+	if key == "DashKeys" then Input:rebind("Dash", "Keyboard", toKeyCodes(value)) end
 end)
 ```
 

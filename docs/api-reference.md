@@ -161,11 +161,10 @@ Kit channels are ordinary intents, so their points follow the same shape — `In
 | `Npc.Spawned` / `Npc.Died` | `npc` | NPCKit lifecycle (`Died` precedes the despawn delay) |
 | `Npc.Action` | `npc, actionName, target` | A moveset action executed |
 | `Npc.Heard` | `npc, heardPosition, source?` | A sound survived range/occlusion for this npc (position pre-blurred by its skill) |
-| `Npc.Idle` / `Npc.IdleEnded` | `(npc, actionName, duration)` / `(npc, actionName)` | An idle action (sleeping, eating) started / finished — hook animations here |
 | `Npc.Path` | `npc, waypoints` | A new route was computed (full list, own position first) — hook for path visualization |
 | `Npc.Hitscan` | `npc, origin, hitPosition, victim?` | A hitscan action fired (hit or miss) — hook for tracers |
 | `Npc.Defense` | `npc, reactionName, success, context` | A defensive reaction attempt (deflect flash or fumble — hook VFX here) |
-| `Npc.Tactic` | `npc, tactic` | Director/behavior state flip: `Pressure`/`Flank`/`Suppress`/`Cover`/`Peek`/`Flee` — hook client animation polish |
+| `Npc.Tactic` | `npc, tactic` | Director role flip: `Pressure`/`Flank`/`Suppress` — hook client animation polish |
 | `Ragdoll.Started` / `Ragdoll.Ended` | `model` | A ragdoll engaged / restored |
 | `Audio.Cue` | `soundName, cueName, handle` | Playback crossed a registered cue time (loop-aware) |
 | `Audio.Subtitle` / `Audio.SubtitleEnded` | `(text, duration)` / `()` | Dialogue line started / finished — wire your subtitle UI here |
@@ -375,7 +374,7 @@ local Ok, Top = Board:getRange(Enum.SortDirection.Descending, 10)
 
 | Member | Description |
 |---|---|
-| `Receipts.attach(kernel, {GetProfile, GetPlayer?, LedgerSize?=200, Bind?=true})` | Binds `ProcessReceipt`; only a landed save acknowledges |
+| `Receipts.attach(kernel, {GetProfile, GetPlayer?, LedgerSize?=2000, Bind?=true})` | Binds `ProcessReceipt`; only a landed save acknowledges |
 | `receipts:onProduct(productId, grantFn(session, receiptInfo))` | |
 | `Transactions.atomic(profileA, profileB, mutate, {Id?}?) → {Ok, Reason?}` | Per-profile locks + replay ids. Reasons: `Aborted, MutatorError, SaveAFailed, SaveBFailed, ProfileInactive, SameProfile, Busy, DuplicateTransaction` |
 
