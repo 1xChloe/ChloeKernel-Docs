@@ -828,12 +828,19 @@ ProjectileClient.new({
 	[1] = {
 		Gravity = 40, -- match the server definition
 		Create = function() return makeProjectilePart() end,
-		OnImpact = function(position) playImpactVfx(position) end,
+		OnImpact = function(position, velocity) playImpactVfx(position, velocity) end,
+		-- Cosmetic hooks: curve the render path, drive per-frame visuals,
+		-- and mask latency by spawning at the muzzle THIS client sees
+		PathOffset = function(seed, age, velocity, flightSeconds) return spiralOffset(seed, age) end,
+		OnRender = function(visual, seed, age, flightSeconds) pulseTrail(visual, age) end,
+		CosmeticOrigin = function(caster, origin) return muzzleOf(caster) end,
 	},
 })
 ```
 
 Keep ids and physics params in one shared module so server sim and client visuals can't drift.
+
+Per-shot flight control on the server: `fire(session, id, origin, direction, timestamp?, maxDistance?, speedMultiplier?)` — `maxDistance` caps this shot's lifetime to `maxDistance/speed` so point-targeted projectiles expire exactly at their aim point (`OnExpire(ownerSession, position)` receives where the shot died, and the expiry position rides to clients for impact VFX), and `speedMultiplier` scales this shot alone with no wire change. The spawn packet carries flight seconds and the caster, so client visuals with a known flight time park at their landing instead of overshooting while the hit packet is in flight, and `CosmeticOrigin` visuals converge from the locally-seen muzzle onto the true path (capped at 25 studs of masking).
 
 ### Make abilities feel instant
 
