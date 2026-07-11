@@ -4,7 +4,7 @@ Roblox game framework with an OS-style architecture: a genre-agnostic kernel (sc
 
 - Priority-scheduled work under a frame budget; buffer-packed serialization at every boundary ([benchmarks](#benchmarks)).
 - Server-authoritative: clients send intents, never state; validation chains are fail-closed; per-channel rate limits; lag-compensated hit validation; movement monitoring.
-- **606 specs** run on every Studio play-test boot. Verification status is documented per feature.
+- **619 specs** run on every Studio play-test boot. Verification status is documented per feature.
 
 Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/selene) and the Argon or Rojo Studio plugin. License: see [LICENSE.md](LICENSE.md) — access is **private**, granted individually by Chloe; use in games requires attribution; sharing or redistribution is not permitted.
 
@@ -63,7 +63,8 @@ Requirements: [aftman](https://github.com/LPGhatguy/aftman) (pinned rojo/stylua/
 | [Award achievements from things that happen](#award-achievements-from-things-that-happen) | [Pause and slow time everywhere at once](#pause-and-slow-time-everywhere-at-once) |
 | [Translate your game's strings](#translate-your-games-strings) | [Erode real surfaces, not particle stand-ins](#erode-real-surfaces-not-particle-stand-ins) |
 | [Direct the camera like a cinematographer](#direct-the-camera-like-a-cinematographer) | [Script cutscenes as timelines](#script-cutscenes-as-timelines) |
-| [Write branching NPC dialogue](#write-branching-npc-dialogue) | |
+| [Write branching NPC dialogue](#write-branching-npc-dialogue) | [Query space like a sentence](#query-space-like-a-sentence) |
+| [Author scaling as curves](#author-scaling-as-curves) | [Stream gameplay by zone occupancy](#stream-gameplay-by-zone-occupancy) |
 
 **Reference:** [API reference](#api-reference) · [Hook points & bus topics](#built-in-hook-points--bus-topics) · [Benchmarks](#benchmarks) · [Project layout](#project-layout) · [Roadmap](#roadmap)
 
@@ -490,6 +491,26 @@ local Granted, Overflow = Loot:award(session, "Chest") -- rolls + grants through
 ```
 
 `roll(name)` rolls with no player (display, previews) and never advances pity. `rollFor(session, name)` rolls against the player's persisted counters. Nesting caps at depth 8 and unknown table references fail at attach. Bus: `Loot.Rolled(tableName, items, session?)`, `Loot.Awarded(session, tableName, granted, overflow)`.
+
+### Author scaling as curves
+
+XP tables, damage falloff, prices, and loot weights are all "given x, what is y" over a few authored keys. Curve holds the keys and answers the question — no if-ladders, no magic formulas nobody can retune:
+
+```lua
+local Xp = Curve.new()
+	:add(1, 100)
+	:add(5, 350)
+	:add(20, 1200)
+
+Xp:at(7)       -- interpolated between the (5, 350) and (20, 1200) keys
+Xp:at(999)     -- 1200 (ends clamp by default; Extrapolate = "Linear" extends)
+Xp:solve(800)  -- the level where the curve crosses 800 xp
+
+local Falloff = Curve.from({ { 0, 34 }, { 60, 34 }, { 300, 8 } }, { Ease = "Smooth" })
+Damage = Falloff:at(distance)
+```
+
+Keys stay sorted whatever order you add them (re-adding an x replaces its y), lookups binary-search, and `Ease` shapes each segment: `Linear` (default), `Smooth` (smoothstep — soft knees for falloff), `Step` (the left key holds — tier tables). `solve(y)` inverts the first crossing, exact for monotonic curves: "what level for this much XP", "what distance drops damage below 10". Pure, allocation-light — build once at boot, query forever.
 
 ### Roll randomness that replays
 
@@ -1282,6 +1303,31 @@ Regions:addTagged("CKZone") -- zone name = "ZoneName" attribute, falling back to
 
 Volume queries on a cadence, not `Touched` — slow walks can't slip through, ragdoll limbs don't double-fire, and leaves always fire before enters on a swap. Destroying (or untagging) a tag-tracked entity fires its leaves immediately; a manually tracked entity that despawns leaves on the next sweep.
 
+### Stream gameplay by zone occupancy
+
+Not Roblox instance streaming — gameplay streaming: the boss, its ambience, its replicas, and its effects should exist only while someone is there to see them. Stages binds resources to a zone and runs the lifecycle:
+
+```lua
+local Stages = Stages.attach(Kernel, { Zones = Zones })
+
+Stages:define("BossArena", {
+	Zone = "Arena", -- a Zones name; occupancy rides Zone.Entered/Left
+	Load = function(stage) -- the FIRST player in builds everything
+		local Boss = Npcs:spawn("Dragon", LairCf)
+		local Ambience = Audio:soundscape("LairDrone")
+		return function() -- the LAST player out tears it down
+			Boss:destroy()
+			Ambience:stop()
+		end
+	end,
+	OnEnter = function(stage, player) Audio:playFor(player, "LairSting") end,
+	Replicas = { ArenaState }, -- zone-bound interest while loaded
+	Linger = 10, -- seconds empty before unload (no spawn-thrash at the door)
+})
+```
+
+One API for every resource kind: `Load` runs once per occupancy episode and returns the unload, `OnEnter`/`OnLeave` fire per occupant (send the sting, push the state), `Replicas` handles `bindZone` while loaded so their delta traffic follows the audience, and `Linger` keeps a briefly-empty stage warm — a player stepping out and back never re-spawns the boss. Leavers count down automatically (Zones publishes their `Zone.Left`), players already standing inside when a stage is defined seed the count, and a throwing closure warns without breaking the sweep. Bus: `Stage.Loaded/Unloaded(name)`, `Stage.Entered/Left(name, player)` — bridge them for client cosmetics.
+
 ### Scope replicas to zones
 
 ```lua
@@ -1319,6 +1365,22 @@ Mounts.attach(Kernel, {
 ```
 
 A waterfall part with `MountType = "Sound"` and `SoundName = "Waterfall"` becomes a positional emitter; a doorway with `MountType = "Zone"` and `ZoneName = "Vault"` feeds `Zones:addPart`; a chain bridge part with `MountType = "BoneChain"` binds its bones into BonePhysics with per-instance `Damping`/`Stiffness`. Built-ins mount only when their system is passed, so the server attaches with Zones and the client with AudioKit and BonePhysics off one tagged map. Tag add/remove signals mount and unmount live, which makes StreamingEnabled maps work for free: what streams in mounts, what streams out cleans up. Bus: `Mount.Added(instance, mountType)`, `Mount.Removed(instance, mountType)`.
+
+### Query space like a sentence
+
+Every ability, AI scan, and loot check is "who is in this shape, filtered". SpatialKit chains it instead of hand-rolling bounds queries and character walks at each call site:
+
+```lua
+local Kit = SpatialKit.new({ Spatial = CharacterIndex, Npcs = Npcs, Teams = Teams })
+
+local Victims = Kit:sphere(blastCenter, 15):players():alive():exclude(caster):collect()
+local Target = Kit:cone(muzzle, facing, 40, 30):npcs():first()
+local Allies = Kit:capsule(beamFrom, beamTo, 6):players():team("Blue"):collect()
+local Carriers = Kit:sphere(origin, 60):players():hasTag("Carrier"):nearest(3)
+local Inside = Kit:box(roomCf, roomSize):count()
+```
+
+Shapes are exact — the box is **oriented** (rotate the CFrame and the volume rotates), the cone is a true 3D aperture, the capsule is a thick segment. Populations pick who is considered: `players()` (characters with a root), `npcs()` (the NPCKit roster), `tagged(tag)` (CollectionService); with none, players plus NPCs when an Npcs kit was wired. Filters stack: `alive()` reads humanoid health (npc handles use their `Alive` flag), `team()` goes through TeamKit's `teamOf` so npc Factions count, `where(fn)` is the escape hatch, and `exclude(caster)` keeps you out of your own blast. Terminals execute: `collect()`, `first()`, `count()`, `nearest(n)` sorted by distance to the shape origin. Positions read live at query time; pass a `Spatial.characters` index and the players population broad-phases through it before the exact tests. Every shape test (`SpatialKit.inSphere/inBox/inCone/inCapsule`) is pure and exported.
 
 ### Query neighbors without touching the DataModel
 
@@ -2945,6 +3007,7 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `Effects.attach(kernel)` · `:define(name, {Duration?, MaxStacks?=1, Stats? = {[stat]=multiplier}, Category?, Immune?, TickSeconds?, OnTick?, OnApply?, OnExpire?})` · `:apply(session, name, {Duration?}?) → stacks` (0 = blocked by an immune ward) · `:cleanse(session, category?) → count` · `:remove` · `:has` · `:stacks` · `:statMultiplier(session, stat) → number` | Humanoid stats auto-applied; periodic OnTick with bounded catch-up; owner `CKEffects` state push; Bus `Effects.Applied/Expired/Blocked/Cleansed` |
 | `Prediction.wrap(net, name, schema, {Predict?, TimeoutSeconds?=2}) → {fire → seq, OnResolved}` | Pairs with `Net:definePredictedIntent(name, schema, opts)` |
 | `Zones.attach(kernel, {IntervalSeconds?=0.25}?)` · `:add(name, part or {parts}, {OnEnter?, OnLeave?}?) → handle` · `:addPart(name, part)` · `:remove(name)` · `:addTagged(tag, {NameAttribute?="ZoneName"}?) → stop` · `:track(entity) → untrack` · `:trackTag(tag) → stop` · `:untrack(entity)` · `:playersIn(name)` · `:entitiesIn(name)` · `:isInside(name, occupant)` | Handle carries `Entered`/`Left` Signals firing `(occupant)`; Bus `Zone.Entered/Left` `(name, player)` for players, `Zone.EntityEntered/EntityLeft` `(name, entity)` for tracked entities (leaves before enters). `addTagged` builds zones from CollectionService tags — same-named parts union into one multi-part zone |
+| `Stages.attach(kernel, {Zones?, Clock?, SkipLoop?}?) → stages` · `:define(name, {Zone, Load?(stage) → cleanup?, Unload?, OnEnter?(stage, player), OnLeave?, Replicas?, Linger?=10}) → stage` · `:occupants(name) → {player}` · `:loaded(name) → boolean` · `:destroy()` | Gameplay resource streaming by zone occupancy (not Roblox streaming): first player in runs `Load` (returns the unload), last out unloads after `Linger`, `Replicas` handles `bindZone` while loaded (needs `Zones`), occupancy rides bus `Zone.Entered/Left`, standing occupants seed at define via `Zones:playersIn`, closure failures warn and never break the sweep; bus `Stage.Loaded/Unloaded(name)` / `Stage.Entered/Left(name, player)` |
 | `Leaderstats.attach(kernel, {Display = {Field, From?, Kind?}}, opts?)` | Values track data on a 1s sweep |
 | `Leaderboards.attach(kernel, {Boards = {[name] = {Ascending?, KeepBest?=true, MaxEntries?=100, CacheSeconds?=60}}, FlushSeconds?=15, WritesPerFlush?=30, Backend?, StorePrefix?="CKBoard_", Clock?, SkipLoop?})` · `:submit(board, playerOrKey, value) → bool` · `:top(board, count?) → {{Key, Value, Rank}}` · `:flushNow()` · `:destroy()` | Global top-N on Roblox OrderedDataStores OR custom stores: backends implement declarative `submit(board, key, value, keepBest, ascending)` (external DBs apply keep-best atomically their way) or DataStore-shaped `set(board, key, updater)`, plus `sorted`; queued submits (newest per key per window), per-window write budget, cached reads, failed writes retry; Bus `Leaderboard.Updated` |
 | `Fuzz.run(kernel, {Session, Channels?, CasesPerChannel?=32, Seed?=1, IncludeRequests?=true, Driver?, Silent?})` · returns `{Channels, Cases, Passed, Rejected, HandlerErrors = {{Channel, Kind, Args, Error}}}` | Hostile payloads per schema type through the real hook chain + handler pipeline; validator throws count as rejects; deterministic per seed |
@@ -2970,6 +3033,8 @@ Kernel:registerService(CheckpointKit.service({ MinimumLegitSeconds = 3 }))
 | `MaterialKit.new({Clock?, SkipLoop?}?) → kit` · `kit:bind(meshPart, {Seed?, NoiseScale?=0.35, Bias?, OnFaceGone?}?) → (surface?, reason?)` · `kit:bindBox(part, {Subdivisions?=4 (1..24), Seed?, NoiseScale?, Bias?, OnFaceGone?}?) → (surface?, reason?)` · `surface:setProgress(alpha)` · `:play({Duration, Reverse?, OnDone?})` · `:restore()` · `:destroy()` · `MaterialKit.supported()` · pure `MaterialKit.order(centroids, seed?, noiseScale?, bias?) → ranks` | Real-geometry erosion over EditableMesh: faces remove and re-add in Perlin rank order (midpoint ladder, `Bias` adds direction), the baked part renders the live object so edits show with no re-bake; `bind` = the part's own mesh asset (HairKit's two permission gates), `bindBox` = generated subdivided overlay, no permissions, original keeps collision and hides; `OnFaceGone(worldCentroid, normal)` per removal; render-only, local-only VFX |
 | `CameraKit.attach(kernel, {Camera?, Clock?, SkipLoop?}?) → cam` · `cam:cut(shot)` · `:blend(shot, seconds?=1, ease?)` · `:release(seconds?)` · `:capture()` · `:current()` · `:destroy()` · shots `{Type = "Static"|"Follow"|"Orbit"|"Rail", CFrame?, Target?, Offset?, Damping?=8, Distance?=20, Height?=5, Speed?=0.5, Angle?, Points?, Duration?, Ease?, LookAt?, FOV?}` · pure `CameraKit.ease(alpha, style?)` / `CameraKit.rail(points, alpha) → CFrame` | One PreRender stepper evaluates the active shot against live targets (Vector3/BasePart/Model/fn); blend eases from the real current pose so moving targets stay tracked; Rail = Catmull-Rom with eased progress and optional LookAt; release blends home and restores CameraType; dead targets hand the camera back; Impact shake composes on top |
 | `CutsceneKit.register(name, events, {Duration?, ReleaseBlend?=0.6}?)` (both machines, U8 ids by order) · `CutsceneKit.server(kernel) → {play(name, origin?)}` (one `CKCUT_Play` packet) · `CutsceneKit.attach(kernel, {Camera?, AnimKit?, AudioKit?, VfxSuite?, Rigs?, Handlers?, Clock?, SkipListen?, SkipLoop?}?) → kit` · `kit:play(name, origin?) → scene` · `:skip()` · `:active()` · `:destroy()` · pure `CutsceneKit.due` | Timeline events `{Time, Action, ...}` shape-checked at register: Shot/Blend (CameraKit; string Targets resolve via Rigs), Anim (AnimKit rigs, stopped at scene end/skip), Sound (AudioKit at the origin), Vfx (VfxSuite), Line (bus `Cutscene.Line(textKey, seconds)`), custom Handlers; skip drops pending events, stops anims, releases the camera; bus `Cutscene.Started/Ended/Skipped` |
+| `SpatialKit.new({Spatial?, Npcs?, Teams?, GetPlayers?}?) → kit` · shapes `kit:sphere(position, radius)` / `:box(cframe, size)` (oriented) / `:cone(origin, direction, range, fovDegrees)` (true 3D) / `:capsule(from, to, radius)` → query · populations `:players()` / `:npcs()` / `:tagged(tag)` · filters `:alive()` / `:team(name)` / `:hasTag(tag)` / `:where(fn(subject, position))` / `:exclude(subjectOrList)` · terminals `:collect() → {subject}` / `:first()` / `:count()` / `:nearest(n?)` (distance-sorted) · pure `SpatialKit.inSphere/inBox/inCone/inCapsule` | Fluent spatial queries: positions read live at query time (root part, `npc:position()`, pivot); no population = players + npcs when an Npcs kit was given; a `Spatial.characters` index broad-phases the players population; `team()` rides TeamKit `teamOf` (npc Factions count); queries are one-shot |
+| `Curve.new({Ease? = "Linear"\|"Smooth"\|"Step", Extrapolate? = "Clamp"\|"Linear"}?)` · `Curve.from({{x, y}, ...}, options?)` · `curve:add(x, y) → curve` (sorted; same x replaces) · `:at(x) → y` · `:solve(y) → x?` (first crossing, linearly inverted; Step answers the landing key) · `:keys() → {{x, y}}` | Piecewise scaling curves for XP/damage/prices/loot: binary-searched segments, ease per segment, ends clamp by default or extend edge slopes with `Extrapolate = "Linear"`; single key = constant, empty `at()` fails loud; pure |
 | `Rules.attach(kernel, {Clock?}?) → engine` · `engine:on(topic) → rule` · rule chain `:where(predicate)` · `:count(every)` · `:once()` · `:cooldown(seconds)` · `:key(keyOf)` · `:run(action) → {disconnect, Stats = {Matched, Fired}}` · `engine:destroy()` | Declarative bus automation: every stage gates the next, counted per key (default: the first event arg — the session in every kit's convention); weak-keyed counters drop with departed sessions; actions run via `task.spawn` (a throwing rule never breaks the bus); stages chained after `run()` error |
 | `Rng.new(seed) → roll` · `roll:float(min?, max?)` (`[0,1)` argless, `[0,max)` one-arg, `[min,max)` two) · `:int(min, max)` (inclusive) · `:choice(list) → item?` · `:shuffle(list) → copy` (Fisher-Yates, input untouched) · `:fork(name) → child` | Deterministic seeded randomness over Roblox `Random` (same seed, same sequence, every platform); `fork` derives an independent child stream from (seed, name) via an FNV-flavored fold — subsystems never shift each other's draws |
 | `Time.attach(kernel, {Clock?, SkipLoop?}?) → kernel.Time` · `:now()` (os.clock) · `:server()` (GetServerTimeNow) · `:frame()` (accumulated, never pauses) · `:scaled()` (honors scale + pause) · `:setScale(scale)` · `:getScale()` · `:pause()` / `:resume()` · `:isPaused()` · `:step(dt)` (spec seam) · `:destroy()` | One clock surface; `scaled()` integrates scale×dt each Heartbeat and never rewinds — gameplay reads it, UI reads `frame()`; bus `Time.ScaleChanged(scale)` / `Time.Paused` / `Time.Resumed` |

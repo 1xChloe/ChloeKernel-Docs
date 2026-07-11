@@ -330,6 +330,26 @@ local Granted, Overflow = Loot:award(session, "Chest") -- rolls + grants through
 
 `roll(name)` rolls with no player (display, previews) and never advances pity. `rollFor(session, name)` rolls against the player's persisted counters. Nesting caps at depth 8 and unknown table references fail at attach. Bus: `Loot.Rolled(tableName, items, session?)`, `Loot.Awarded(session, tableName, granted, overflow)`.
 
+### Author scaling as curves
+
+XP tables, damage falloff, prices, and loot weights are all "given x, what is y" over a few authored keys. Curve holds the keys and answers the question — no if-ladders, no magic formulas nobody can retune:
+
+```lua
+local Xp = Curve.new()
+	:add(1, 100)
+	:add(5, 350)
+	:add(20, 1200)
+
+Xp:at(7)       -- interpolated between the (5, 350) and (20, 1200) keys
+Xp:at(999)     -- 1200 (ends clamp by default; Extrapolate = "Linear" extends)
+Xp:solve(800)  -- the level where the curve crosses 800 xp
+
+local Falloff = Curve.from({ { 0, 34 }, { 60, 34 }, { 300, 8 } }, { Ease = "Smooth" })
+Damage = Falloff:at(distance)
+```
+
+Keys stay sorted whatever order you add them (re-adding an x replaces its y), lookups binary-search, and `Ease` shapes each segment: `Linear` (default), `Smooth` (smoothstep — soft knees for falloff), `Step` (the left key holds — tier tables). `solve(y)` inverts the first crossing, exact for monotonic curves: "what level for this much XP", "what distance drops damage below 10". Pure, allocation-light — build once at boot, query forever.
+
 ### Roll randomness that replays
 
 `math.random` gives you numbers; `Rng` gives you *sequences you can reproduce* — the difference between "a dungeon" and "dungeon #48291 that a bug report can name":
@@ -1121,6 +1141,31 @@ Regions:addTagged("CKZone") -- zone name = "ZoneName" attribute, falling back to
 
 Volume queries on a cadence, not `Touched` — slow walks can't slip through, ragdoll limbs don't double-fire, and leaves always fire before enters on a swap. Destroying (or untagging) a tag-tracked entity fires its leaves immediately; a manually tracked entity that despawns leaves on the next sweep.
 
+### Stream gameplay by zone occupancy
+
+Not Roblox instance streaming — gameplay streaming: the boss, its ambience, its replicas, and its effects should exist only while someone is there to see them. Stages binds resources to a zone and runs the lifecycle:
+
+```lua
+local Stages = Stages.attach(Kernel, { Zones = Zones })
+
+Stages:define("BossArena", {
+	Zone = "Arena", -- a Zones name; occupancy rides Zone.Entered/Left
+	Load = function(stage) -- the FIRST player in builds everything
+		local Boss = Npcs:spawn("Dragon", LairCf)
+		local Ambience = Audio:soundscape("LairDrone")
+		return function() -- the LAST player out tears it down
+			Boss:destroy()
+			Ambience:stop()
+		end
+	end,
+	OnEnter = function(stage, player) Audio:playFor(player, "LairSting") end,
+	Replicas = { ArenaState }, -- zone-bound interest while loaded
+	Linger = 10, -- seconds empty before unload (no spawn-thrash at the door)
+})
+```
+
+One API for every resource kind: `Load` runs once per occupancy episode and returns the unload, `OnEnter`/`OnLeave` fire per occupant (send the sting, push the state), `Replicas` handles `bindZone` while loaded so their delta traffic follows the audience, and `Linger` keeps a briefly-empty stage warm — a player stepping out and back never re-spawns the boss. Leavers count down automatically (Zones publishes their `Zone.Left`), players already standing inside when a stage is defined seed the count, and a throwing closure warns without breaking the sweep. Bus: `Stage.Loaded/Unloaded(name)`, `Stage.Entered/Left(name, player)` — bridge them for client cosmetics.
+
 ### Scope replicas to zones
 
 ```lua
@@ -1158,6 +1203,22 @@ Mounts.attach(Kernel, {
 ```
 
 A waterfall part with `MountType = "Sound"` and `SoundName = "Waterfall"` becomes a positional emitter; a doorway with `MountType = "Zone"` and `ZoneName = "Vault"` feeds `Zones:addPart`; a chain bridge part with `MountType = "BoneChain"` binds its bones into BonePhysics with per-instance `Damping`/`Stiffness`. Built-ins mount only when their system is passed, so the server attaches with Zones and the client with AudioKit and BonePhysics off one tagged map. Tag add/remove signals mount and unmount live, which makes StreamingEnabled maps work for free: what streams in mounts, what streams out cleans up. Bus: `Mount.Added(instance, mountType)`, `Mount.Removed(instance, mountType)`.
+
+### Query space like a sentence
+
+Every ability, AI scan, and loot check is "who is in this shape, filtered". SpatialKit chains it instead of hand-rolling bounds queries and character walks at each call site:
+
+```lua
+local Kit = SpatialKit.new({ Spatial = CharacterIndex, Npcs = Npcs, Teams = Teams })
+
+local Victims = Kit:sphere(blastCenter, 15):players():alive():exclude(caster):collect()
+local Target = Kit:cone(muzzle, facing, 40, 30):npcs():first()
+local Allies = Kit:capsule(beamFrom, beamTo, 6):players():team("Blue"):collect()
+local Carriers = Kit:sphere(origin, 60):players():hasTag("Carrier"):nearest(3)
+local Inside = Kit:box(roomCf, roomSize):count()
+```
+
+Shapes are exact — the box is **oriented** (rotate the CFrame and the volume rotates), the cone is a true 3D aperture, the capsule is a thick segment. Populations pick who is considered: `players()` (characters with a root), `npcs()` (the NPCKit roster), `tagged(tag)` (CollectionService); with none, players plus NPCs when an Npcs kit was wired. Filters stack: `alive()` reads humanoid health (npc handles use their `Alive` flag), `team()` goes through TeamKit's `teamOf` so npc Factions count, `where(fn)` is the escape hatch, and `exclude(caster)` keeps you out of your own blast. Terminals execute: `collect()`, `first()`, `count()`, `nearest(n)` sorted by distance to the shape origin. Positions read live at query time; pass a `Spatial.characters` index and the players population broad-phases through it before the exact tests. Every shape test (`SpatialKit.inSphere/inBox/inCone/inCapsule`) is pure and exported.
 
 ### Query neighbors without touching the DataModel
 

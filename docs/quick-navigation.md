@@ -51,7 +51,8 @@
 | [Award achievements from things that happen](#award-achievements-from-things-that-happen) | [Pause and slow time everywhere at once](#pause-and-slow-time-everywhere-at-once) |
 | [Translate your game's strings](#translate-your-games-strings) | [Erode real surfaces, not particle stand-ins](#erode-real-surfaces-not-particle-stand-ins) |
 | [Direct the camera like a cinematographer](#direct-the-camera-like-a-cinematographer) | [Script cutscenes as timelines](#script-cutscenes-as-timelines) |
-| [Write branching NPC dialogue](#write-branching-npc-dialogue) | |
+| [Write branching NPC dialogue](#write-branching-npc-dialogue) | [Query space like a sentence](#query-space-like-a-sentence) |
+| [Author scaling as curves](#author-scaling-as-curves) | [Stream gameplay by zone occupancy](#stream-gameplay-by-zone-occupancy) |
 
 **Reference:** [API reference](#api-reference) · [Hook points & bus topics](#built-in-hook-points--bus-topics) · [Benchmarks](#benchmarks) · [Project layout](#project-layout) · [Roadmap](#roadmap)
 
