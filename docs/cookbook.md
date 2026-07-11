@@ -215,6 +215,22 @@ local PlayerData = DataDriver.new({
 
 The backup target is any backend: a second DataStore (default, named `{Name}_Backups`), or `"Http"` to keep copies entirely off Roblox. Roblox's own point-in-time versioning (`ListVersionsAsync`) still works underneath as a third layer, since the driver only ever writes through `UpdateAsync`.
 
+### Snapshot and roll back player data
+
+Backups guard against corruption across sessions; snapshots guard a single risky mutation inside one. Take a point-in-time copy of `profile.Data` before the operation, roll back if it goes sideways:
+
+```lua
+local Id = Profile:snapshot("before trade")
+
+local Result = Transactions.atomic(ProfileA, ProfileB, mutate)
+if not Result.Ok and SomethingLooksWrong then
+	Profile:rollback(Id) -- Data is a deep copy of the snapshot again
+	Profile:save()       -- persisting the rollback is your call
+end
+```
+
+Snapshots are in-memory deep copies: session-only, never persisted, ring keeps the newest 8 per profile. A snapshot survives repeated rollbacks (roll back, poke at the state, roll back again), `snapshots()` lists `{Id, Label, TakenAt}` for admin panels, and `rollback(id)` on an evicted or unknown id returns `(false, reason)` instead of guessing. Specs and admin commands are the natural homes — this is a scalpel for "undo that one thing", not a durability layer; backups above are that.
+
 ### Sell a developer product safely
 
 Receipts are acknowledged only after the grant has persisted — grant, persist, *then* acknowledge:
@@ -314,6 +330,24 @@ local Granted, Overflow = Loot:award(session, "Chest") -- rolls + grants through
 
 `roll(name)` rolls with no player (display, previews) and never advances pity. `rollFor(session, name)` rolls against the player's persisted counters. Nesting caps at depth 8 and unknown table references fail at attach. Bus: `Loot.Rolled(tableName, items, session?)`, `Loot.Awarded(session, tableName, granted, overflow)`.
 
+### Roll randomness that replays
+
+`math.random` gives you numbers; `Rng` gives you *sequences you can reproduce* — the difference between "a dungeon" and "dungeon #48291 that a bug report can name":
+
+```lua
+local Roll = Rng.new(WorldSeed)
+Roll:float()          -- [0, 1)
+Roll:int(1, 6)        -- inclusive dice
+Roll:choice(Loot)     -- uniform pick, nil on empty
+Roll:shuffle(Deck)    -- Fisher-Yates over a copy; Deck is untouched
+
+-- Independent streams per subsystem:
+local Chests = Roll:fork("Chests")
+local Npcs = Roll:fork("Npcs")
+```
+
+`fork(name)` derives a child seeded from (parent seed, name), and that is the load-bearing feature: chest generation drawing one extra roll never shifts what the NPCs decide, because they never shared a stream. Same seed, same sequence, every platform (it wraps Roblox's `Random`, which guarantees this). Seed procedural maps, loot previews, replays, and deterministic specs from one world seed; LootKit already accepts an `Rng` at attach.
+
 ### Craft items at stations
 
 CraftingKit is recipes over InventoryKit — inputs check atomically before any take, timed crafts queue with cancel refunds, and station recipes gate on where the player crafts:
@@ -399,6 +433,25 @@ Kernel.Scheduler:schedule(rebuildNavMesh, Kernel.Priority.High)
 
 The scheduler drains queues in priority order under a per-frame budget. On the **server** the budget is frame-aware by default: each step spends the slack left under a 16.5ms frame target after the engine's measured share of the frame (`Stats.HeartbeatTimeMs`), so an idle server drains backlog fast and a physics-heavy one backs off automatically — never below a 1.5ms floor. The **client** defaults to a fixed 1.5ms slice (the render thread's cost is invisible to the frame stat, so "fill the frame" would starve rendering). `Background` runs only on spare budget; `Kernel` priority can't be starved. Task errors are isolated and reported on `Scheduler.OnError`.
 
+### Pause and slow time everywhere at once
+
+Pause menus and slow-motion kills die in review because forty timers each read their own clock. `Time.attach(kernel)` makes game time one switch:
+
+```lua
+Time.attach(Kernel)
+
+Kernel.Time:now()      -- monotonic seconds (os.clock)
+Kernel.Time:server()   -- the shared server clock (what claims stamp)
+Kernel.Time:frame()    -- seconds across rendered frames; never pauses
+Kernel.Time:scaled()   -- game time: honors setScale and pause
+
+Kernel.Time:setScale(0.25) -- bullet time: scaled() advances at quarter rate
+Kernel.Time:pause()        -- scaled() freezes; frame() keeps counting
+Kernel.Time:resume()
+```
+
+Gameplay systems read `scaled()` for cooldowns, effect durations, and ability timers; UI animation reads `frame()` so menus stay alive while the world is frozen. Scale changes never rewind — the accumulator integrates scale×dt each frame, so history stands. Bus: `Time.ScaleChanged(scale)`, `Time.Paused`, `Time.Resumed` (drive your vignette or tick sound from these). Specs drive `step(dt)` manually with `SkipLoop = true`.
+
 ### Run long-lived behaviors you can pause or kill
 
 A `Process` is a coroutine with a lifecycle (PID, state machine, exit signal) stepped by the scheduler — for any logic that runs across frames:
@@ -474,6 +527,27 @@ Forensics.replay(Capture, { Loop = true })
 ```
 
 Frames are flat arrays `[t, px, py, pz, lx, ly, lz, vx, vy, vz, humanoidState]` at `RecordHz` (default 10) covering `WindowSeconds` before the flag (default 20) plus `TailSeconds` after (default 5) — the movement before, during, and after the violation as reconstructable data. A web tool can rebuild the run frame by frame from the JSON; `replay()` does it in Studio with an interpolated ghost. Re-flags during the tail append reasons to the same capture, leavers finalize immediately, delivery never blocks the sweep (function destinations and `{ Url }` POSTs both fail into the in-memory ring, last `MaxCaptures` always readable). Captures hold movement, reasons, and the user id only. Bus: `Forensics.Captured(player, capture)`.
+
+### Give giant monsters frame-perfect hits
+
+Engine spatial queries read physics parts, and a boss's parts lag their true server pose mid-animation. Sweeps never touches them — the attack volume is math:
+
+```lua
+local Attacks = Sweeps.attach(Kernel, { Spatial = Characters })
+Attacks:define("TailSwipe", {
+	Duration = 0.6,
+	Capsules = { -- root-local, pure functions of swing phase 0..1
+		function(phase)
+			local Angle = math.rad(200) * phase
+			return { From = Vector3.zero, To = Vector3.new(math.sin(Angle), 0, math.cos(Angle)) * 30, Radius = 4 }
+		end,
+	},
+})
+-- from the boss brain, synced to the animation:
+Attacks:start("TailSwipe", { Root = boss.PrimaryPart, OnHit = function(victim, position) dealDamage(victim, 40) end })
+```
+
+Each tick reconstructs the capsules in world space from the live root CFrame and tests them mathematically against player capsules, sub-stepping between phases so a fast swing cannot skip anyone. Hits dedupe per victim per swing; candidates broad-phase through the Spatial index. Bus: `Sweep.Hit(swing, victim, position)`.
 
 ### Validate hits with lag compensation
 
@@ -842,6 +916,21 @@ Keep ids and physics params in one shared module so server sim and client visual
 
 Per-shot flight control on the server: `fire(session, id, origin, direction, timestamp?, maxDistance?, speedMultiplier?)` — `maxDistance` caps this shot's lifetime to `maxDistance/speed` so point-targeted projectiles expire exactly at their aim point (`OnExpire(ownerSession, position)` receives where the shot died, and the expiry position rides to clients for impact VFX), and `speedMultiplier` scales this shot alone with no wire change. The spawn packet carries flight seconds and the caster, so client visuals with a known flight time park at their landing instead of overshooting while the hit packet is in flight, and `CosmeticOrigin` visuals converge from the locally-seen muzzle onto the true path (capped at 25 studs of masking).
 
+Genuinely curved trajectories (orbits, spirals, boomerangs) use an authoritative `Path` instead of the cosmetic `PathOffset`:
+
+```lua
+-- One shared module, referenced by BOTH definitions
+local function orbitPath(seed, age, origin, velocity, flightSeconds)
+	local Swirl = math.sin(age * 6 + seed) * 4
+	return origin + velocity * age + Vector3.new(0, 0, Swirl)
+end
+
+-- Server: PJ:define(2, { Speed = 60, Path = orbitPath, Hitbox = ..., OnHit = ... })
+-- Client: [2] = { Path = orbitPath, Create = ... }
+```
+
+The server sweeps each tick's `Path(t-dt) → Path(t)` segment for walls and capsule hits, so the hitbox follows the curve exactly — no more visual arcing one way while the hit line flies straight. The function is deterministic from data both machines already hold (wire serial as seed, origin, velocity, flight seconds), so it costs zero extra wire bytes; clients render the identical function and bank along its tangent. `PathOffset` remains for pure flourish that must not affect hits.
+
 ### Make abilities feel instant
 
 Optimistic prediction: the client acts immediately, the server validates, rejections roll back. No round-trip lag on button presses, no trust in the client:
@@ -958,6 +1047,41 @@ Buffs:define("Poison", { Duration = 6, Category = "Toxin", TickSeconds = 1,
 Buffs:define("Ward", { Duration = 30, Immune = { "Curse", "Toxin" } })
 Buffs:cleanse(session, "Toxin") -- the antidote
 ```
+
+### Cast zonal spells as expanding hazards
+
+Hazards are dynamic procedural zones — where Zones wraps static parts, a hazard is an annulus band evaluated as distance checks, with a client mirror for the VFX:
+
+```lua
+-- Shared module: the ring's radius curves (server occupancy + client visuals)
+local RingOfFire = {
+	Inner = function(age) return 4 + age * 3 end,
+	Outer = function(age) return 8 + age * 3 end,
+}
+
+-- Server
+local Zones = Hazards.attach(Kernel)
+Zones:define(1, { Inner = RingOfFire.Inner, Outer = RingOfFire.Outer, Height = 8, Duration = 6 })
+Zones:spawn(1, { Anchor = casterRoot }) -- or a fixed Vector3
+
+Kernel.Bus:subscribe("Hazard.Entered", function(_, hazard, player)
+	Buffs:apply(Kernel:getSession(player), "Burning") -- damage stays game-side
+end)
+Kernel.Bus:subscribe("Hazard.Left", function(_, hazard, player)
+	Buffs:cleanse(Kernel:getSession(player), "Fire")
+end)
+
+-- Client: every player renders the ring locally, pooled and seed-deterministic
+HazardClient.new({
+	[1] = {
+		Inner = RingOfFire.Inner, Outer = RingOfFire.Outer,
+		Create = makeRingVisual,
+		OnRender = function(visual, seed, age, inner, outer) scaleRing(visual, inner, outer) end,
+	},
+})
+```
+
+The occupancy sweep tests each occupant's last-position → position **segment** against the band, so a sprint through a thin ring cannot tunnel between samples (a through-crossing fires Entered then Left in the same tick — touch semantics land). Radii are functions of age, anchors may be moving Instances (the band follows the caster and retires if they despawn), `Duration` auto-retires with everyone inside receiving Left first, and the spawn/retire packet pair means no hand-rolled net channel per zonal spell. Bus: `Hazard.Spawned/Entered/Left/Retired`.
 
 ### React to players and NPCs entering areas
 
@@ -1172,6 +1296,58 @@ Kernel.Bus:subscribe("Quest.Completed", function(_, player, questId) ... end)
 
 A quest is data: objectives count **bus topics the server publishes** ([the catalog](#built-in-hook-points--bus-topics) is the menu), so quests can't be spoofed — there is no client input to validate. By default an event counts for a session when any published arg is that session or its player; `Match` additionally pins an arg (a zone name, a weapon id), and `Filter = fn(session, topic, ...)` takes full control (required for actor-less topics like `Round.PhaseChanged`). Progress persists via `session.Profile` when a DataDriver is attached; `Repeatable` resets to fresh on completion (dailies). `assign`/`abandon`/`progress` on the service handle the rest.
 
+### Automate reactions to game events
+
+The kits publish; your game reacts. Rules turns "subscribe, keep a counter table, check a cooldown, remember who already got it" into a chain:
+
+```lua
+local Engine = Rules.attach(Kernel)
+
+-- Every 10th kill grants a rampage buff:
+Engine:on("Combat.Kill")
+	:count(10)
+	:run(function(session) Effects:apply(session, "Rampage") end)
+
+-- First legendary ever, once per player, with a filter:
+Engine:on("Inventory.Granted")
+	:where(function(session, itemId) return Items[itemId].Rarity == "Legendary" end)
+	:once()
+	:run(function(session) Audio:playFor(session.Player, "LegendaryFanfare") end)
+
+-- At most one bounty announcement per minute per player:
+local Handle = Engine:on("Bounty.Claimed")
+	:cooldown(60)
+	:run(function(session) announce(session.Player) end)
+Handle.Stats -- { Matched, Fired }; Handle.disconnect() to stop
+```
+
+Chain order is free and every stage gates the next: `where` filters on the event args, `count(n)` fires every nth surviving match, `once()` fires a single time, `cooldown(seconds)` drops matches inside the window — all counted **per key**, defaulting to the first event arg (the session, in every kit's publish convention; override with `:key(fn)`). `run(action)` arms the rule and locks the chain (stages after it error). Counters hold weak keys so departed sessions drop their state, and actions run through `task.spawn` — a throwing rule never breaks the bus.
+
+### Award achievements from things that happen
+
+AchievementKit is Rules' persistent cousin: a topic, an optional filter, a target count — and progress that lives in the profile, so it survives rejoins and unlocks exactly once per player ever:
+
+```lua
+local Achievements = AchievementKit.attach(Kernel, {
+	Achievements = {
+		Slayer = {
+			Topic = "Combat.Kill",
+			Count = 100,
+			Reward = function(session) Inventory:grant(session, "SlayerCape", 1) end,
+		},
+		FirstLegendary = {
+			Topic = "Inventory.Granted",
+			Where = function(session, itemId) return Items[itemId].Rarity == "Legendary" end,
+		},
+	},
+})
+
+Achievements:progress(session, "Slayer") -- (count, target, unlocked) for UI
+Kernel.Bus:subscribe("Achievement.Unlocked", function(_, session, id) ... end)
+```
+
+The first event arg must resolve to the session (override with `SessionOf` per achievement, for topics that lead with something else). Progress and unlocks store under `profile.Data.Achievements` (rename via `Field`), `Reward` runs once at unlock, and post-unlock events are ignored — no re-grants. Bus: `Achievement.Progress(session, id, count, target)` on every step for toasts and bars, `Achievement.Unlocked(session, id)` once. Like quests, achievements count server-published topics: there is nothing for a client to spoof.
+
 ### Let players interact with the world
 
 ```lua
@@ -1196,6 +1372,43 @@ end, 10)
 ```
 
 A prompt trigger is **client input** — exploit tooling fires prompts from across the map — so every trigger re-validates server-side: distance (with latency slack), line of sight (server raycast, not the prompt's client-side flag), and per-player cooldown, all through the fail-closed `Intent.Interact` chain before `OnInteract` runs. Bus: `Interact.Triggered(session, id, instance)`, `Interact.Rejected(player, id)`.
+
+### Write branching NPC dialogue
+
+Dialogue trees live server-side; the client renders what it is sent and answers with an index — there is nothing to spoof:
+
+```lua
+local Dialogue = DialogueKit.attach(Kernel, {
+	Dialogues = {
+		Blacksmith = {
+			Start = "Greet",
+			Nodes = {
+				Greet = {
+					Line = "Smith.Greet", Speaker = "Smith.Name", -- Text keys; localize at render
+					Choices = {
+						{ Text = "Smith.AskWares", Next = "Wares" },
+						{ Text = "Smith.AskSecret", Next = "Secret",
+						  Where = function(session) return session.Profile.Data.Reputation >= 10 end },
+						{ Text = "Smith.Leave" }, -- no Next = the conversation ends
+					},
+				},
+				Wares = { Line = "Smith.Wares", Next = "Greet",
+				          OnEnter = function(session) Shop:open(session, "Smithy") end },
+				Secret = { Line = "Smith.Secret",
+				           OnEnter = function(session) Quests:assign(session, "HiddenForge") end },
+			},
+		},
+	},
+})
+
+-- Start from a prompt (begin is server-side only):
+Kernel:registerService(InteractionKit.service({
+	Interactions = { TalkSmith = { Tag = "Smith", ActionText = "Talk",
+		OnInteract = function(session) Dialogue:begin(session, "Blacksmith") end } },
+}))
+```
+
+A `Where`-gated choice a player fails is **never sent** — and since picks index the visible list and gates re-check at pick time, a client cannot select what it cannot see. `Run`/`OnEnter` consequences execute in server code; a throwing one warns without breaking the tree; every `Next` reference validates at attach. The wire is one `DLG_Sync` state push per node (`{Dialogue, Node, Line, Speaker?, Choices}`, `{}` on close) plus fail-closed `DLG_Choose`/`DLG_Advance` intents gated against the session's live node — the client half is a state listener and two intent fires. Leavers clean up mid-sentence, `Dialogue.CanBegin` (fail-open) vetoes starts (combat lockouts), and the bus narrates: `Dialogue.Started/Node/Choice/Ended(reason)`.
 
 ### Swing hair, capes, and tails
 
@@ -1269,6 +1482,113 @@ end })
 
 Avatars are catalog meshes the experience cannot editable-load, so their voxel sampling falls back to bounding-box grids — blocky silhouettes. `Chunks = true` fixes that on both `play()` and `morph()`: every source part clones as a full-detail flying chunk (meshes, textures, faces, SurfaceAppearance survive; joints, welds, sounds, and emitters strip) that rides the same noise field or morph flight while shrinking into the dust. Detail stays perfect at launch and melts into particulate instead of starting squared. Chunks respect the erosion threshold, so partial dissolves and restructures work on them too. On meshes the experience owns, vertex sampling already yields detailed voxel shells without chunks.
 
+### Erode real surfaces, not particle stand-ins
+
+Dissolve flies voxel dots; MaterialKit removes the actual rendered geometry — the wall a spell eats loses its true surface, hole by hole, in noise order:
+
+```lua
+local Kit = MaterialKit.new()
+
+-- Any Part, zero permissions: a generated subdivided overlay erodes while
+-- the original keeps collision (invisible behind it)
+local Surface = Kit:bindBox(wall, { Subdivisions = 10 })
+Surface:play({ Duration = 2 })                 -- crumble to nothing
+Surface:play({ Duration = 2, Reverse = true }) -- knit back together
+
+-- Owned mesh assets erode their real triangles (HairKit's permission gates)
+local Statue = Kit:bind(statueMeshPart, {
+	Bias = Vector3.new(0, 0.05, 0), -- bottom erodes first
+	OnFaceGone = function(centroid, normal) Dust:Emit(centroid) end,
+})
+Statue:setProgress(0.6) -- manual driver: wards, channeled spells
+```
+
+The load-bearing engine fact (verified live): a MeshPart baked from `Content.fromObject(editable)` renders from the live object, so face removal shows immediately — no re-bake, no instance churn. `setProgress` works both directions (removed triangles re-add against their recorded vertex ids), so a receding driver restructures the surface exactly like Dissolve's wards. `bind` opens the part's own mesh asset behind the same two permission gates as HairKit (`MaterialKit.supported()` probes the experience setting; third-party assets return `(nil, reason)`); `bindBox` needs neither — it generates its geometry from scratch, which is why the spec suite exercises it fully wherever the Mesh APIs are on. Render-only, local-only: collision stays on the game's part, and you broadcast the trigger like any Dissolve play.
+
+### Direct the camera like a cinematographer
+
+CameraKit makes shots data — declare what the camera does and blend between declarations; the kit tracks live targets through every transition:
+
+```lua
+local Cam = CameraKit.attach(Kernel) -- client; one PreRender stepper
+
+Cam:cut({ Type = "Static", CFrame = CFrame.lookAt(gateEye, gate.Position), FOV = 40 })
+Cam:blend({ Type = "Orbit", Target = boss, Distance = 40, Height = 12, Speed = 0.4 }, 2)
+Cam:blend({ Type = "Rail", Points = flyover, Duration = 6, LookAt = arena }, 1.5)
+Cam:blend({ Type = "Follow", Target = hero, Offset = CFrame.new(3, 4, 10) }, 1)
+Cam:release(1) -- ease back to the player camera, CameraType restored
+```
+
+`blend` eases from the camera's *real current pose* and evaluates the destination shot live each frame, so orbiting into a moving boss stays glued to the boss. Rails run Catmull-Rom through CFrame points with eased progress (`Ease = "Linear" | "Smooth" | "In" | "Out"`) and face along the rail unless `LookAt` overrides; Follow exp-smooths its offset (`Damping`). Targets are Vector3s, parts, models, or functions — a target that dies hands the camera back instead of freezing on nothing. `capture()`/`release()` own the Scriptable flip so the player camera comes back exactly as it was; Impact's shake offsets compose on top. Pure `CameraKit.ease`/`rail` for specs.
+
+### Script cutscenes as timelines
+
+A cutscene is the same shape as a VfxSuite sequence — flat events, one packet, every client plays it locally:
+
+```lua
+-- Shared module, both machines:
+CutsceneKit.register("BossIntro", {
+	{ Time = 0.0, Action = "Shot", Shot = { Type = "Static", CFrame = gateCam, FOV = 40 } },
+	{ Time = 0.5, Action = "Anim", Rig = "Boss", Anim = "Roar" },
+	{ Time = 0.6, Action = "Sound", Sound = "BossRoar" },
+	{ Time = 1.2, Action = "Blend", Shot = { Type = "Orbit", Target = "Boss", Distance = 35 }, Seconds = 2 },
+	{ Time = 2.0, Action = "Line", Text = "Boss.Intro.Threat", Seconds = 3 },
+	{ Time = 5.5, Action = "Vfx", Vfx = "GroundShatter" },
+}, { Duration = 8 })
+
+-- Server: one packet, everyone watches
+local Scenes = CutsceneKit.server(Kernel)
+Scenes:play("BossIntro", arenaOrigin)
+
+-- Client: wire the integrations once
+local Kit = CutsceneKit.attach(Kernel, {
+	Camera = Cam, AnimKit = Anims, AudioKit = Audio, VfxSuite = Vfx,
+	Rigs = { Boss = workspace.Boss }, -- names resolve here, definitions stay Instance-free
+})
+Kernel.Bus:subscribe("Cutscene.Line", function(_, key, seconds) Subtitles:show(Locales:get(player, key), seconds) end)
+Input:on("Skip", function() Kit:skip() end)
+```
+
+Shot `Target`/`LookAt` strings resolve through the `Rigs` roster at play time, so the shared definition never holds an Instance. `skip()` jumps to the end honestly: pending events drop, scene-started animations stop, the camera releases with a blend (`ReleaseBlend`, default 0.6s). Line events publish `Cutscene.Line(textKey, seconds)` — pair with [Text](#translate-your-games-strings) and subtitles localize for free. Custom actions dispatch to `Handlers`. Bus lifecycle: `Cutscene.Started/Ended/Skipped`.
+
+### Sequence multi-stage VFX as data
+
+VfxSuite replaces bespoke effect scripts with declarative timelines. The server sends one packet; every client drives the whole lifecycle locally in one stepper:
+
+```lua
+-- Shared module (runs on both machines: ids assign by registration order)
+VfxSuite.register("GroundShatter", {
+	{ Time = 0.0, Action = "Spawn", Id = "Crack", Lifetime = 3 },
+	{ Time = 0.1, Action = "Emit", Id = "Crack", Emitter = "Shockwave", Count = 150 },
+	{ Time = 0.4, Action = "Sound", Sound = "ExplosionEcho" },
+	{ Time = 0.8, Action = "Dissolve", Id = "Crack", Duration = 1 },
+	{ Time = 0.0, Action = "Impact", Intensity = 1, Radius = 80 }, -- custom action
+}, { Templates = { Crack = crackModel } })
+
+-- Server: one packet per cast, nothing spawns server-side
+Casts:play("GroundShatter", groundCFrame)
+
+-- Client
+local Suite = VfxSuite.attach(Kernel, {
+	AudioKit = Audio,
+	Dissolve = Vfx,
+	Handlers = { Impact = function(event, context) Feedback:pulse(context.CFrame.Position, event) end },
+})
+```
+
+Built-ins: `Spawn` (pooled template at the timeline CFrame, `Lifetime` auto-releases), `Emit` (`:Emit(Count)` on named emitters of a spawn), `Sound` (AudioKit `playAt`), `Dissolve` (a Dissolve play on the spawn, extra fields pass through as the config). Anything else dispatches to your `Handlers`. Events shape-check at register, so a typo fails the boot instead of a random cast.
+
+### Sell the hit: screen-space impact feedback
+
+Impact is the one shake script to rule them all — distance-localized, device-aware, audio-coupled:
+
+```lua
+local Feedback = Impact.attach(Kernel, { AudioKit = Audio })
+Feedback:pulse(explosionOrigin, { Intensity = 1, Radius = 80, Duration = 0.5 })
+```
+
+Intensity falls off quadratically from the origin to the local camera, a damped spring offsets the camera CFrame (pulses stack — springs accumulate impulses), AudioKit side-chain ducks the ambient bus so the explosion owns the mix, and blur + color-correction dips engage only when `DeviceBench` quality clears `PostQuality` — low-end devices keep the shake and the duck, never the post-processing bill.
+
 ### Ragdoll bodies that replicate for free
 
 ```lua
@@ -1333,6 +1653,25 @@ Rig:ik("Grab", { Type = "Reach", EndEffector = rightHand, Target = Vector3.new(3
 ```
 
 Tracks cache per rig, exclusive groups keep one locomotion clip alive, markers forward to the bus, and the IK layer wraps `IKControl` with the same fade stepper as AudioKit — weights blend in/out instead of snapping, `release()` restores the skeleton, and everything a rig created dies with its model. `Properties` passes raw IKControl overrides for anything the options don't cover, and `assetIds()` feeds the preloader.
+
+### Plant feet and bank big rigs
+
+Gait conforms a monster to the terrain it actually walks on — flat animation tracks stop reading as skating:
+
+```lua
+local Rig = Anim:attachRig(dragonModel)
+local Walker = Gait.bind(Rig, {
+	Legs = {
+		{ ChainRoot = dragonModel.FrontLeftHip, EndEffector = dragonModel.FrontLeftFoot },
+		{ ChainRoot = dragonModel.FrontRightHip, EndEffector = dragonModel.FrontRightFoot },
+		{ ChainRoot = dragonModel.BackLeftHip, EndEffector = dragonModel.BackLeftFoot },
+		{ ChainRoot = dragonModel.BackRightHip, EndEffector = dragonModel.BackRightFoot },
+	},
+	Tilt = { Bank = 0.2, Max = 15 },
+})
+```
+
+Each leg down-casts from a look-ahead point (effector plus `velocity * LookAhead`) and drives an AnimKit Reach IK onto the hit, so feet meet slopes and stairs while the animation keeps its cycle — airborne legs hand back to the track. The root joint's Transform carries a smoothed body-height offset (hips stay centered over uneven footing) and a velocity-derived tilt matrix: the dragon leans into hard turns before the animation ever shifts. All client cosmetic — Motor6D Transform slots and IK targets only, physics and the server never see it.
 
 ### Preload assets behind a loading screen
 
@@ -1407,6 +1746,26 @@ end)
 ```
 
 Writes ride a rate-limited intent through the fail-closed chain: unknown keys reject, numbers **clamp** into `Min/Max`, strings cap at `MaxLength`, and string arrays are **rebuilt clean** so hidden hash keys never reach storage. Values persist via the DataDriver profile (pre-profile writes merge in, player's choice wins) and `Settings_Sync` pushes the authoritative value back so an out-of-range optimistic set self-corrects. Bus: `Settings.Changed(session, key, value)` — wire it to InputDriver `rebind` and remaps survive rejoins.
+
+### Translate your game's strings
+
+Text resolves keys through the player's locale with a fallback chain, so shipping a partial translation degrades to English instead of erroring:
+
+```lua
+local Locales = Text.attach(Kernel, {
+	Default = "en-us",
+	Locales = {
+		["en-us"] = { ["Inventory.Full"] = "Your bag is full", Coins = "{Count} coins" },
+		["fr-fr"] = { ["Inventory.Full"] = "Votre sac est plein" },
+		fr = { Farewell = "Au revoir" }, -- language-half table: serves fr-be, fr-ca...
+	},
+})
+
+Locales:get(player, "Inventory.Full")            -- resolves via player.LocaleId
+Locales:format(player, "Coins", { Count = 100 }) -- "100 coins"
+```
+
+Resolution walks exact locale → language half (`fr-fr` falls back to `fr`) → `Default`; a key missing everywhere warns once and returns the key itself, so an untranslated screen reads as its keys — findable, never a crash. `format` interpolates `{Name}` placeholders from the vars table (unmatched placeholders stay literal; pure `Text.interpolate` for tests), and `LocaleOf` overrides the locale read for player settings menus. Both machines attach the same shared module — for replica-driven UI, send **keys** over the wire and localize at render, one string table instead of per-locale packets.
 
 ### Ship gameplay analytics
 
@@ -1523,11 +1882,30 @@ task.delay(2, function() Casings:release(Casing) end)
 
 `Instance.new`/`Destroy` churn fragments memory and stutters frames; pools turn both into table operations. ProjectileClient uses one internally.
 
+### Trace what the kernel just did
+
+"Why did this player lose their sword?" Chronicle answers with what actually happened instead of a guess — it records the last 30 seconds of bus and hook activity into a ring you can query:
+
+```lua
+local Recorder = Chronicle.attach(Kernel) -- decorates the live Bus.publish + Hooks.fire
+
+-- ...something goes wrong...
+print(Recorder:format("Inventory"))
+-- 41.20s Bus Inventory.Granted(Chloe, Sword, 1)
+-- 43.87s Hook Intent.INV_Move(Chloe) [PASS]
+-- 44.02s Bus Inventory.Taken(Chloe, Sword, 1)
+
+Recorder:trace(function(entry) return entry.Verdict == "REJECTED" end) -- every hook rejection
+Recorder:detach() -- restores the undecorated bus and hooks
+```
+
+Every publish records `{At, Kind, Topic, Args}`; every hook fire additionally records the verdict (`PASS` or `REJECTED`). `trace(filter)` returns entries oldest-first — a substring matches against topic or args, a predicate takes full control — and the window (`Seconds`, default 30, cap `MaxEntries` 2048) rolls off old entries by itself. Summarization keeps names, numbers, and short strings and reduces instances and tables to their names, so the recorder never pins a session or leaks an object reference. Recording costs a summarize per publish/fire: attach it in Studio or behind a debug flag, not unconditionally in production.
+
 ### Watch everything live with the debug panel
 
 > **Try it live:** [ChloKernel Test](https://www.roblox.com/games/81098553592999/ChloKernel-Test) is the framework's public test place with the debug panel enabled for every joiner — press **F8** in-game to open the CLIENT / SERVER / NET windows on a real server.
 
-An immediate-mode (ImGui-style) debug overlay, split into **three windows — CLIENT, SERVER, and NET** — so each machine's stats read separately and the wire has its own view. Client: FPS, ping, network kbps, physics rate, memory breakdown, scheduler health with hot-task profiling, kernel internals, live log tail. Server (mirrored via diagnostics attributes): sessions, services, scheduler health, hot tasks, net counters. NET: live kernel channel traffic from both machines. All windows drag independently and tooltip to their own right side. **Studio-only by design** — it auto-attaches in Studio and refuses to exist in production unless ReplicatedStorage has the `ChloeKernelDebug` attribute explicitly set to `true`. On a live server, also set `ChloeKernelDebugUserIds` (comma-separated UserIds) to restrict the whole surface to those users: the panel only attaches for them, the NET/log mirrors fire per-recipient (never broadcast — they carry every player's decoded traffic and the full server log), and the simulation controls reject everyone else. **F8** toggles everything (F9 is Roblox's own dev console); title bars drag (dragging never collapses — only a clean click does).
+An immediate-mode (ImGui-style) debug overlay, split into **five windows — CLIENT, SERVER, NET, HOOKS, and HEAT** — so each machine's stats read separately and the wire, the hook surface, and the scheduler each have their own view. Client: FPS, ping, network kbps, physics rate, memory breakdown, scheduler health with hot-task profiling, kernel internals, live log tail. Server (mirrored via diagnostics attributes): sessions, services, scheduler health, hot tasks, net counters. NET: live kernel channel traffic from both machines. All windows drag independently and tooltip to their own right side. **Studio-only by design** — it auto-attaches in Studio and refuses to exist in production unless ReplicatedStorage has the `ChloeKernelDebug` attribute explicitly set to `true`. On a live server, also set `ChloeKernelDebugUserIds` (comma-separated UserIds) to restrict the whole surface to those users: the panel only attaches for them, the NET/log mirrors fire per-recipient (never broadcast — they carry every player's decoded traffic and the full server log), and the simulation controls reject everyone else. **F8** toggles everything (F9 is Roblox's own dev console); title bars drag (dragging never collapses — only a clean click does).
 
 **Reading the panel:**
 
@@ -1535,6 +1913,8 @@ An immediate-mode (ImGui-style) debug overlay, split into **three windows — CL
 - **The Frame sections decompose the whole frame.** Both windows split measured frame compute into *engine + other scripts* (heartbeat phase minus the kernel), *physics*, the *kernel share*, and (client) *render CPU* — when a frame is slow, the red row names WHOSE problem it is before you reach for a profiler. The server budget bar then shows the slack that composition leaves the kernel (frame-aware budgeting).
 - **Bars show consumed vs permitted.** The *frame budget* bar in both scheduler sections reads `used / budget ms (%)` — at 100% the step stops and remaining tasks defer to the next frame, so the bar tells you how close the kernel is to deferring *before* `Deferred` goes nonzero. The server's *Total* memory bar reads against Roblox's 6.25GB hard cap (the server crashes at the cap). Hover any bar for what the limit is and what happens at it.
 - **The NET window is a live wire inspector.** Every kernel channel message from BOTH machines (the server's entries arrive on a debug-only mirror): direction arrows (↑ client→server, ↓ server→client), channel, decoded arguments, payload bytes computed from the schema, processing time server-side / round-trip time for requests, and the verdict — **Rejected** (validator said no), **RateLimited** (token bucket), **Dropped** (Packet's 8KB/heartbeat flood cap or the ~900-byte unreliable limit). **Pause** freezes the tail for inspection, **Clear** resets it, and a checkbox hides replica noise. **Click any row to pin it in the Inspector**, which shows the message both ways: the *decoded* argument values and the *serialized* payload as hex — the exact bytes the Packet type engine writes for those values. Totals up top: messages/s and KB/s each direction plus running verdict counters.
+- **The HOOKS window is the validator surface live.** Every hook point on this machine with fire and rejection counts, sorted by recent activity; defined-but-never-fired points show dimmed (a gate nobody fires is a gate nobody tests). Click a point to pin it: fail stance and handler count, average/max chain cost measured around the live call (a slow validator taxes every intent on its channel), a fires-per-second sparkline, and how long ago the last rejection was. Rejections are not errors — fail-closed gates rejecting bad input is the design working.
+- **The HEAT window is the scheduler as a heatmap.** The step strip graphs whole-scheduler ms/s over the last minute; below it every hot task gets a color-graded bar (green under 1 ms/s, amber under 5, red past it) with its call count, and clicking a row pins that task's rolling cost history — a spike that lives in one task reads differently from one smeared across all of them. Fed by the same profiler window the CLIENT hot-task list reads.
 - **The Engine section works where memory tracking does not.** Roblox disables engine memory tracking in ALL production builds and its switch (`Stats.MemoryTrackingEnabled`) is read-only — no script, setting, or flag re-enables it, so total/category memory exists only in Studio. The SERVER window compensates with ungated engine counters published by diagnostics: *replication* and *physics repl* bandwidth (the suspect when frame compute reads green but the server still lags — replication CPU has no public timing stat), *primitives* (total and awake), and *contacts*. Lua heap, GC, and Instance rows work everywhere.
 - **Hover any stat for a diagnostic tooltip** — not just what the number means, but *where to look when it's wrong*. Hover `Lua heap` and it tells you the usual leak suspects (insert-only arrays, undisconnected connections, per-player tables not cleared — and that `session:bind()` exists for exactly this); hover `Instances` and it points at unpooled projectiles/VFX and respawn clones; hover `Queues`/`Recurring`/`Processes`/`Hook points` and each names its own leak pattern.
 - **Hot tasks name the exact offender.** Both scheduler sections list the heaviest task origins (ms/s) by their defining `script:line` — the kernel profiles every scheduled function and attributes the time, so "something is lagging" becomes "`Systems.Combat:131` is eating 4.2ms/s, open it." Processes show as **`Process <name>`** (their work runs inside their own coroutine, so the time belongs to the process — not to the kernel's resume line). Hover an entry for the full path and call count. (`Scheduler:topTasks(n)` / `:resetProfile()` expose the same data; `Scheduler.setTaskOrigin(fn, label)` names your own functions.)

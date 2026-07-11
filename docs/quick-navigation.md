@@ -12,6 +12,7 @@
 | [Replicate live state with deltas](#replicate-live-state-with-deltas) | [Trade items between players](#trade-items-between-players) | [Teleport players without tripping the anti-cheat](#teleport-players-without-tripping-the-anti-cheat) |
 | [Ask the server a question](#ask-the-server-a-question) | [Share state across servers](#share-state-across-servers) | [Punish network spammers](#punish-network-spammers) |
 | [Bridge bus events across the network](#bridge-bus-events-across-the-network) | [Send events across servers](#send-events-across-servers) | |
+| | [Snapshot and roll back player data](#snapshot-and-roll-back-player-data) | |
 
 | Gameplay systems | Infrastructure |
 |---|---|
@@ -27,6 +28,9 @@
 | [Dissolve things into drifting voxels](#dissolve-things-into-drifting-voxels) | [Adapt replication to each player's connection](#adapt-replication-to-each-players-connection) |
 | [Query neighbors without touching the DataModel](#query-neighbors-without-touching-the-datamodel) | [Record exploiters for forensic replay](#record-exploiters-for-forensic-replay) |
 | [Author attachments in the map](#author-attachments-in-the-map) | [Recycle scratch tables in hot loops](#recycle-scratch-tables-in-hot-loops) |
+| [Cast zonal spells as expanding hazards](#cast-zonal-spells-as-expanding-hazards) | [Give giant monsters frame-perfect hits](#give-giant-monsters-frame-perfect-hits) |
+| [Sequence multi-stage VFX as data](#sequence-multi-stage-vfx-as-data) | [Sell the hit: screen-space impact feedback](#sell-the-hit-screen-space-impact-feedback) |
+| [Plant feet and bank big rigs](#plant-feet-and-bank-big-rigs) | |
 | [Apply buffs and debuffs](#apply-buffs-and-debuffs) | [Watch kernel health in live servers](#watch-kernel-health-in-live-servers) |
 | [React to players and NPCs entering areas](#react-to-players-and-npcs-entering-areas) | [Write tests](#write-tests) |
 | [Show stats on the leaderboard](#show-stats-on-the-leaderboard) | [Benchmark your own systems](#benchmark-your-own-systems) |
@@ -42,7 +46,12 @@
 | [Scope replicas to zones](#scope-replicas-to-zones) | [Swing hair, capes, and tails](#swing-hair-capes-and-tails) |
 | [Ragdoll bodies that replicate for free](#ragdoll-bodies-that-replicate-for-free) | [Preload assets behind a loading screen](#preload-assets-behind-a-loading-screen) |
 | [Run the whole soundstage](#run-the-whole-soundstage) | [Scale effects to the device](#scale-effects-to-the-device) |
-| [Animate rigs and blend inverse kinematics](#animate-rigs-and-blend-inverse-kinematics) | |
+| [Animate rigs and blend inverse kinematics](#animate-rigs-and-blend-inverse-kinematics) | [Trace what the kernel just did](#trace-what-the-kernel-just-did) |
+| [Automate reactions to game events](#automate-reactions-to-game-events) | [Roll randomness that replays](#roll-randomness-that-replays) |
+| [Award achievements from things that happen](#award-achievements-from-things-that-happen) | [Pause and slow time everywhere at once](#pause-and-slow-time-everywhere-at-once) |
+| [Translate your game's strings](#translate-your-games-strings) | [Erode real surfaces, not particle stand-ins](#erode-real-surfaces-not-particle-stand-ins) |
+| [Direct the camera like a cinematographer](#direct-the-camera-like-a-cinematographer) | [Script cutscenes as timelines](#script-cutscenes-as-timelines) |
+| [Write branching NPC dialogue](#write-branching-npc-dialogue) | |
 
 **Reference:** [API reference](#api-reference) · [Hook points & bus topics](#built-in-hook-points--bus-topics) · [Benchmarks](#benchmarks) · [Project layout](#project-layout) · [Roadmap](#roadmap)
 
